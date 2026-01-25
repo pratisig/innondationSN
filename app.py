@@ -1,52 +1,50 @@
-import streamlit as st 
-import geopandas as gpd 
-import pandas as pd 
-import osmnx as ox 
-import folium 
-from streamlit_folium import st_folium 
-from datetime import datetime 
-import requests
+======================================================
 
-###======================================================
+Flood Infra Tracker Sénégal – V1
 
-#CONFIG STREAMLIT
+Application institutionnelle Streamlit
 
-###======================================================
+Données : OpenStreetMap + NASA POWER
+
+Auteur : Prototype GIS institutionnel
+
+======================================================
+
+import streamlit as st import geopandas as gpd import pandas as pd import osmnx as ox import folium from streamlit_folium import st_folium from datetime import datetime import requests
+
+======================================================
+
+CONFIG STREAMLIT
+
+======================================================
 
 st.set_page_config( page_title="Flood Infra Tracker Sénégal", layout="wide", page_icon="🌊" )
 
-st.title("🌊 Flood Infra Tracker – Sénégal") 
-st.caption("Suivi institutionnel des infrastructures exposées aux inondations")
+st.title("🌊 Flood Infra Tracker – Sénégal") st.caption("Suivi institutionnel des infrastructures exposées aux inondations")
 
-##======================================================
+======================================================
 
-#SIDEBAR PARAMÈTRES
+SIDEBAR – PARAMÈTRES
 
-###======================================================
+======================================================
 
 st.sidebar.header("Paramètres d'analyse")
 
 region = st.sidebar.text_input( "Zone d'intérêt", value="Senegal", help="Pays, région ou département (ex: Dakar, Kaolack)" )
 
-start_date = st.sidebar.date_input("Date début", datetime(2024, 8, 1)) 
-end_date = st.sidebar.date_input("Date fin", datetime(2024, 8, 10))
+start_date = st.sidebar.date_input("Date début", datetime(2024, 8, 1)) end_date = st.sidebar.date_input("Date fin", datetime(2024, 8, 10))
 
 rain_threshold = st.sidebar.slider( "Seuil pluie cumulée (mm)", min_value=20, max_value=150, value=80 )
 
 load_data = st.sidebar.button("Lancer l'analyse")
 
-###======================================================
+======================================================
 
-#FONCTIONS DONNÉES
+FONCTIONS DONNÉES
 
-###======================================================
+======================================================
 
-def get_osm_infrastructure(place): 
-    tags = { "highway": True, "bridge": True, "amenity": ["school", "hospital", "clinic"] } 
-    gdf = ox.geometries_from_place(place, tags) 
-    gdf = gdf.reset_index() 
-    gdf = gdf[gdf.geometry.notnull()] 
-    gdf = gdf.to_crs(epsg=4326)
+def get_osm_infrastructure(place): tags = { "highway": True, "bridge": True, "amenity": ["school", "hospital", "clinic"] } gdf = ox.geometries_from_place(place, tags) gdf = gdf.reset_index() gdf = gdf[gdf.geometry.notnull()] gdf = gdf.to_crs(epsg=4326)
 
 def classify(row):
     if row.get("highway"):
@@ -62,14 +60,19 @@ def classify(row):
 gdf["type"] = gdf.apply(classify, axis=1)
 return gdf[["type", "geometry"]]
 
-def get_nasa_power_rain(lat, lon, start, end): url = "https://power.larc.nasa.gov/api/temporal/daily/point" params = { "parameters": "PRECTOTCORR", "community": "AG", "longitude": lon, "latitude": lat, "start": start.strftime("%Y%m%d"), "end": end.strftime("%Y%m%d"), "format": "JSON" } r = requests.get(url, params=params) data = r.json() values = data["properties"]["parameter"]["PRECTOTCORR"] 
+def get_nasa_power_rain(lat, lon, start, end): 
+    url = "https://power.larc.nasa.gov/api/temporal/daily/point" 
+    params = { "parameters": "PRECTOTCORR", "community": "AG", "longitude": lon, "latitude": lat, "start": start.strftime("%Y%m%d"), "end": end.strftime("%Y%m%d"), "format": "JSON" } 
+    r = requests.get(url, params=params) 
+    data = r.json() 
+    values = data["properties"]["parameter"]["PRECTOTCORR"] 
     return sum(values.values())
 
-###======================================================
+======================================================
 
-#TRAITEMENT PRINCIPAL
+TRAITEMENT PRINCIPAL
 
-###======================================================
+======================================================
 
 if load_data: with st.spinner("Chargement des infrastructures OSM..."): gdf_infra = get_osm_infrastructure(region)
 
@@ -150,10 +153,10 @@ with st.form("signalement"):
     if submitted:
         st.success("Signalement enregistré (local – V1)")
 
-###======================================================
+======================================================
 
-#FOOTER
+FOOTER
 
-###======================================================
+======================================================
 
 st.caption("Prototype institutionnel – Données ouvertes OSM & NASA POWER")
