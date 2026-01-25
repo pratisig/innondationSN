@@ -12,7 +12,7 @@ st.title("🌊 Flood Infra Tracker – Sénégal") st.caption("Suivi institution
 
 ======================================================
 
-SIDEBAR – PARAMÈTRES
+SIDEBAR PARAMÈTRES
 
 ======================================================
 
