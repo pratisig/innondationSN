@@ -1,32 +1,32 @@
-======================================================
+#======================================================
 
-Flood Infra Tracker Sénégal – V1
+#Flood Infra Tracker Sénégal – V1
 
-Application institutionnelle Streamlit
+#Application institutionnelle Streamlit
 
-Données : OpenStreetMap + NASA POWER
+#Données : OpenStreetMap + NASA POWER
 
-Auteur : Prototype GIS institutionnel
+#Auteur : Prototype GIS institutionnel
 
-======================================================
+#======================================================
 
 import streamlit as st import geopandas as gpd import pandas as pd import osmnx as ox import folium from streamlit_folium import st_folium from datetime import datetime import requests
 
-======================================================
+#======================================================
 
-CONFIG STREAMLIT
+#CONFIG STREAMLIT
 
-======================================================
+#======================================================
 
 st.set_page_config( page_title="Flood Infra Tracker Sénégal", layout="wide", page_icon="🌊" )
 
 st.title("🌊 Flood Infra Tracker – Sénégal") st.caption("Suivi institutionnel des infrastructures exposées aux inondations")
 
-======================================================
+#======================================================
 
-SIDEBAR – PARAMÈTRES
+#SIDEBAR – PARAMÈTRES
 
-======================================================
+#======================================================
 
 st.sidebar.header("Paramètres d'analyse")
 
@@ -38,11 +38,11 @@ rain_threshold = st.sidebar.slider( "Seuil pluie cumulée (mm)", min_value=20, m
 
 load_data = st.sidebar.button("Lancer l'analyse")
 
-======================================================
+#======================================================
 
-FONCTIONS DONNÉES
+#FONCTIONS DONNÉES
 
-======================================================
+#======================================================
 
 def get_osm_infrastructure(place): tags = { "highway": True, "bridge": True, "amenity": ["school", "hospital", "clinic"] } gdf = ox.geometries_from_place(place, tags) gdf = gdf.reset_index() gdf = gdf[gdf.geometry.notnull()] gdf = gdf.to_crs(epsg=4326)
 
@@ -68,11 +68,11 @@ def get_nasa_power_rain(lat, lon, start, end):
     values = data["properties"]["parameter"]["PRECTOTCORR"] 
     return sum(values.values())
 
-======================================================
+#======================================================
 
-TRAITEMENT PRINCIPAL
+#TRAITEMENT PRINCIPAL
 
-======================================================
+#======================================================
 
 if load_data: with st.spinner("Chargement des infrastructures OSM..."): gdf_infra = get_osm_infrastructure(region)
 
@@ -153,10 +153,10 @@ with st.form("signalement"):
     if submitted:
         st.success("Signalement enregistré (local – V1)")
 
-======================================================
+#======================================================
 
-FOOTER
+#FOOTER
 
-======================================================
+#======================================================
 
 st.caption("Prototype institutionnel – Données ouvertes OSM & NASA POWER")
