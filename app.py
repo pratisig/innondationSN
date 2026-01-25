@@ -15,7 +15,8 @@ import requests
 
 st.set_page_config( page_title="Flood Infra Tracker Sénégal", layout="wide", page_icon="🌊" )
 
-st.title("🌊 Flood Infra Tracker – Sénégal") st.caption("Suivi institutionnel des infrastructures exposées aux inondations")
+st.title("🌊 Flood Infra Tracker – Sénégal") 
+st.caption("Suivi institutionnel des infrastructures exposées aux inondations")
 
 ##======================================================
 
