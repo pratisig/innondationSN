@@ -40,7 +40,8 @@ st.sidebar.header("Paramètres d'analyse")
 
 region = st.sidebar.text_input( "Zone d'intérêt", value="Senegal", help="Pays, région ou département (ex: Dakar, Kaolack)" )
 
-start_date = st.sidebar.date_input("Date début", datetime(2024, 8, 1)) end_date = st.sidebar.date_input("Date fin", datetime(2024, 8, 10))
+start_date = st.sidebar.date_input("Date début", datetime(2024, 8, 1)) 
+end_date = st.sidebar.date_input("Date fin", datetime(2024, 8, 10))
 
 rain_threshold = st.sidebar.slider( "Seuil pluie cumulée (mm)", min_value=20, max_value=150, value=80 )
 
