@@ -1,15 +1,3 @@
-======================================================
-
-Flood Infra Tracker Sénégal – V1
-
-Application institutionnelle Streamlit
-
-Données : OpenStreetMap + NASA POWER
-
-Auteur : Prototype GIS institutionnel
-
-======================================================
-
 import streamlit as st import geopandas as gpd import pandas as pd import osmnx as ox import folium from streamlit_folium import st_folium from datetime import datetime import requests
 
 ======================================================
