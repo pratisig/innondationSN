@@ -9,7 +9,7 @@ import requests
 
 ###======================================================
 
-CONFIG STREAMLIT
+#CONFIG STREAMLIT
 
 ###======================================================
 
@@ -19,7 +19,7 @@ st.title("🌊 Flood Infra Tracker – Sénégal") st.caption("Suivi institution
 
 ##======================================================
 
-SIDEBAR PARAMÈTRES
+#SIDEBAR PARAMÈTRES
 
 ###======================================================
 
@@ -35,7 +35,7 @@ load_data = st.sidebar.button("Lancer l'analyse")
 
 ###======================================================
 
-FONCTIONS DONNÉES
+#FONCTIONS DONNÉES
 
 ###======================================================
 
@@ -59,7 +59,7 @@ def get_nasa_power_rain(lat, lon, start, end): url = "https://power.larc.nasa.go
 
 ###======================================================
 
-TRAITEMENT PRINCIPAL
+#TRAITEMENT PRINCIPAL
 
 ###======================================================
 
@@ -144,7 +144,7 @@ with st.form("signalement"):
 
 ###======================================================
 
-FOOTER
+#FOOTER
 
 ###======================================================
 
