@@ -88,7 +88,8 @@ def get_nasa_power_rain(lat, lon, start, end):
 
 #======================================================
 
-if load_data: with st.spinner("Chargement des infrastructures OSM..."): gdf_infra = get_osm_infrastructure(region)
+if load_data: 
+with st.spinner("Chargement des infrastructures OSM..."): gdf_infra = get_osm_infrastructure(region)
 
 st.success(f"{len(gdf_infra)} infrastructures chargées depuis OSM")
 
