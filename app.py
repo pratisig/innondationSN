@@ -62,8 +62,7 @@ def classify(row):
 gdf["type"] = gdf.apply(classify, axis=1)
 return gdf[["type", "geometry"]]
 
-def get_nasa_power_rain(lat, lon, start, end): 
-url = "https://power.larc.nasa.gov/api/temporal/daily/point" params = { "parameters": "PRECTOTCORR", "community": "AG", "longitude": lon, "latitude": lat, "start": start.strftime("%Y%m%d"), "end": end.strftime("%Y%m%d"), "format": "JSON" } r = requests.get(url, params=params) data = r.json() values = data["properties"]["parameter"]["PRECTOTCORR"] 
+def get_nasa_power_rain(lat, lon, start, end): url = "https://power.larc.nasa.gov/api/temporal/daily/point" params = { "parameters": "PRECTOTCORR", "community": "AG", "longitude": lon, "latitude": lat, "start": start.strftime("%Y%m%d"), "end": end.strftime("%Y%m%d"), "format": "JSON" } r = requests.get(url, params=params) data = r.json() values = data["properties"]["parameter"]["PRECTOTCORR"] 
     return sum(values.values())
 
 ###======================================================
