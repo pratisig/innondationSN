@@ -53,7 +53,12 @@ load_data = st.sidebar.button("Lancer l'analyse")
 
 #======================================================
 
-def get_osm_infrastructure(place): tags = { "highway": True, "bridge": True, "amenity": ["school", "hospital", "clinic"] } gdf = ox.geometries_from_place(place, tags) gdf = gdf.reset_index() gdf = gdf[gdf.geometry.notnull()] gdf = gdf.to_crs(epsg=4326)
+def get_osm_infrastructure(place): 
+    tags = { "highway": True, "bridge": True, "amenity": ["school", "hospital", "clinic"] } 
+    gdf = ox.geometries_from_place(place, tags) 
+    gdf = gdf.reset_index() 
+    gdf = gdf[gdf.geometry.notnull()] 
+    gdf = gdf.to_crs(epsg=4326)
 
 def classify(row):
     if row.get("highway"):
