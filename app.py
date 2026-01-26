@@ -36,25 +36,14 @@ st.caption("Satellite-based flood detection using Sentinel-1 SAR and open datase
 # ------------------------------------------------------------
 @st.cache_resource
 def init_gee():
-    try:
-        if "GEE_SERVICE_ACCOUNT" in st.secrets:
-            key = json.loads(st.secrets["GEE_SERVICE_ACCOUNT"])
-            credentials = ee.ServiceAccountCredentials(
-                key["client_email"],
-                key_data=st.secrets["GEE_SERVICE_ACCOUNT"]
-            )
-            ee.Initialize(credentials)
-        else:
-            ee.Initialize()
-        return True
-    except Exception as e:
-        st.error("Google Earth Engine authentication failed.")
-        st.exception(e)
-        return False
-
-gee_ok = init_gee()
-if not gee_ok:
-    st.stop()
+    import ee, json
+    key = json.loads(st.secrets["GEE_SERVICE_ACCOUNT"])
+    credentials = ee.ServiceAccountCredentials(
+        key["client_email"],
+        key_data=json.dumps(key)
+    )
+    ee.Initialize(credentials)
+    return True
 
 # ------------------------------------------------------------
 # FILE UPLOAD
