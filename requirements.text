@@ -1,6 +1,9 @@
 streamlit_folium
 streamlit
-geopandas 
+geopandas
+streamlit
+geopandas
+pyarrow
 osmnx
 folium
 streamlit-folium
