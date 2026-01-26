@@ -15,6 +15,7 @@ import json
 import pandas as pd
 import plotly.express as px
 from shapely.geometry import Polygon, MultiPolygon
+import zipfile
 
 # ------------------------------------------------------------
 # PAGE CONFIG
@@ -48,8 +49,8 @@ init_gee()
 # ------------------------------------------------------------
 st.sidebar.header("1️⃣ Zone d’étude")
 uploaded_file = st.sidebar.file_uploader(
-    "Charger une zone (GeoJSON / SHP / KML)",
-    type=["geojson", "shp", "kml"]
+    "Charger une zone (GeoJSON / SHP ZIP / KML)",
+    type=["geojson", "kml", "zip"]
 )
 
 if not uploaded_file:
@@ -61,9 +62,27 @@ with tempfile.TemporaryDirectory() as tmpdir:
     with open(file_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    gdf = gpd.read_file(file_path)
+    # Gestion des fichiers shapefile zip
+    if uploaded_file.name.endswith(".zip"):
+        with zipfile.ZipFile(file_path, 'r') as zip_ref:
+            zip_ref.extractall(tmpdir)
+        shp_files = [f for f in os.listdir(tmpdir) if f.endswith(".shp")]
+        if not shp_files:
+            st.error("Aucun fichier .shp trouvé dans le zip.")
+            st.stop()
+        file_path = os.path.join(tmpdir, shp_files[0])
+        gdf = gpd.read_file(file_path)
+    elif uploaded_file.name.endswith(".geojson"):
+        gdf = gpd.read_file(file_path, driver="GeoJSON")
+    elif uploaded_file.name.endswith(".kml"):
+        gdf = gpd.read_file(file_path, driver="KML")
+    else:
+        st.error("Format de fichier non supporté.")
+        st.stop()
 
-# Fonction pour convertir Shapely → EE Geometry
+# ------------------------------------------------------------
+# Convert Shapely geometry to EE Geometry
+# ------------------------------------------------------------
 def shapely_to_ee(poly):
     if isinstance(poly, Polygon):
         coords = [list(poly.exterior.coords)]
@@ -142,8 +161,11 @@ flood_img = flood_img.updateMask(slope.lt(5))
 water_perm = ee.Image("JRC/GSW1_4/GlobalSurfaceWater").select("occurrence")
 flood_img = flood_img.updateMask(water_perm.lt(10))
 
+# Population
+pop = ee.ImageCollection("WorldPop/GP/100m/pop").filterDate("2020-01-01", "2020-12-31").mean()
+
 # ------------------------------------------------------------
-# INDICATORS
+# INDICATORS (GLOBAL)
 # ------------------------------------------------------------
 pixel_area = ee.Image.pixelArea()
 
@@ -156,7 +178,6 @@ flood_area = flood_img.multiply(pixel_area).reduceRegion(
 
 flood_area_km2 = ee.Number(flood_area.get("VV")).divide(1e6)
 
-# Rainfall (CHIRPS)
 rain = (
     ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
     .filterBounds(geom)
@@ -171,8 +192,6 @@ rain_mm = rain.reduceRegion(
     maxPixels=1e13
 ).get("precipitation")
 
-# Population
-pop = ee.ImageCollection("WorldPop/GP/100m/pop").filterDate("2020-01-01", "2020-12-31").mean()
 pop_exposed = pop.updateMask(flood_img).reduceRegion(
     reducer=ee.Reducer.sum(),
     geometry=geom,
@@ -190,22 +209,91 @@ col2.metric("Pluie cumulée (mm)", rain_mm.getInfo())
 col3.metric("Population exposée", pop_exposed.getInfo())
 
 # ------------------------------------------------------------
-# MAP
+# MAP INTERACTIVE AVEC POPUPS
 # ------------------------------------------------------------
-st.subheader("🗺️ Carte interactive")
-m = folium.Map(location=[14.5, -14.5], zoom_start=7)
-folium.GeoJson(gdf, name="Zone d’étude").add_to(m)
+st.subheader("🗺️ Carte interactive avec popups")
 
+# Centrer la carte automatiquement
+bounds = gdf.total_bounds  # [minx, miny, maxx, maxy]
+center_lat = (bounds[1] + bounds[3]) / 2
+center_lon = (bounds[0] + bounds[2]) / 2
+m = folium.Map(location=[center_lat, center_lon], zoom_start=10, tiles="CartoDB positron")
+
+# Fonction pour calculer metrics par polygone
+def compute_metrics(poly_geom):
+    ee_poly = shapely_to_ee(poly_geom)
+    
+    # Surface inondée
+    flood_area_poly = flood_img.multiply(ee.Image.pixelArea()).reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=ee_poly,
+        scale=30,
+        maxPixels=1e13
+    )
+    flood_km2 = ee.Number(flood_area_poly.get("VV")).divide(1e6).getInfo() or 0
+    
+    # Population exposée
+    pop_exposed_poly = pop.updateMask(flood_img).reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=ee_poly,
+        scale=100,
+        maxPixels=1e13
+    ).getInfo().get("population", 0)
+    
+    # Surface totale polygone (km²)
+    total_area = poly_geom.area / 1e6  # m² → km²
+    return total_area, flood_km2, int(pop_exposed_poly)
+
+# Ajouter chaque polygone avec popup
+for idx, row in gdf.iterrows():
+    poly = row.geometry
+    total_area, flood_area_poly, pop_exposed_poly = compute_metrics(poly)
+    
+    popup_html = f"""
+    <b>Zone {idx + 1}</b><br>
+    Surface totale: {total_area:.2f} km²<br>
+    Surface inondée: {flood_area_poly:.2f} km²<br>
+    Population exposée: {pop_exposed_poly}
+    """
+    
+    folium.GeoJson(
+        poly,
+        style_function=lambda feature: {
+            "fillColor": "#ff7800",
+            "color": "#ff7800",
+            "weight": 2,
+            "fillOpacity": 0.2,
+        },
+        tooltip=folium.Tooltip(f"Zone {idx + 1}"),
+        popup=folium.Popup(popup_html, max_width=300)
+    ).add_to(m)
+
+# Zones inondées overlay
 flood_vis = {"min": 0, "max": 1, "palette": ["blue"]}
 flood_layer = folium.raster_layers.TileLayer(
     tiles=flood_img.getMapId(flood_vis)["tile_fetcher"].url_format,
     attr="Flood extent",
     name="Zones inondées",
     overlay=True,
-    control=True
+    control=True,
+    opacity=0.6,
 )
 flood_layer.add_to(m)
+
+# Légende
+legend_html = """
+<div style="position: fixed; 
+     bottom: 50px; left: 50px; width: 200px; height: 60px; 
+     background-color: white; z-index:9999; font-size:14px;
+     border:2px solid grey; padding: 5px;">
+     <b>Légende</b><br>
+     <i style="background: #ff7800; width: 15px; height: 15px; float: left; margin-right: 5px;"></i> Zone d'étude<br>
+     <i style="background: blue; width: 15px; height: 15px; float: left; margin-right: 5px;"></i> Zones inondées
+</div>
+"""
+m.get_root().html.add_child(folium.Element(legend_html))
 folium.LayerControl().add_to(m)
+
 st_folium(m, width=1100, height=600)
 
 # ------------------------------------------------------------
