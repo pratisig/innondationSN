@@ -80,7 +80,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
     except Exception as e:
         st.error(f"Erreur lecture fichier : {e}"); st.stop()
 
-# Géométrie globale
+# Géométrie globale simplifiée pour GEE
 merged_poly = gdf.geometry.unary_union.simplify(0.001, preserve_topology=True)
 geom = shapely_to_ee(merged_poly)
 st.success(f"✅ Zone chargée : {len(gdf)} entité(s)")
@@ -125,11 +125,24 @@ with st.spinner("Analyse satellite Sentinel-1..."):
     flood_img = detect_floods(geom.getInfo(), start_date, end_date)
 
 # ------------------------------------------------------------
-# INDICATEURS PAR ZONE
+# CALCUL DES INDICATEURS GLOBAUX
 # ------------------------------------------------------------
 pixel_area = ee.Image.pixelArea()
 pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").filterDate("2020-01-01","2020-12-31").mean()
 
+total_flood_area = ee.Number(flood_img.multiply(pixel_area).reduceRegion(ee.Reducer.sum(),geom,100,maxPixels=1e13).get("VV")).divide(1e6).getInfo()
+total_pop_exposed = int(ee.Number(pop_img.updateMask(flood_img).reduceRegion(ee.Reducer.sum(),geom,100,maxPixels=1e13).get("population")).getInfo())
+total_rain = float(ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(geom).filterDate(str(start_date),str(end_date)).sum().reduceRegion(ee.Reducer.mean(),geom,5000,maxPixels=1e13).get("precipitation").getInfo())
+
+st.subheader("📊 Indicateurs globaux")
+c1,c2,c3 = st.columns(3)
+c1.metric("Surface inondée", f"{total_flood_area:.2f} km²")
+c2.metric("Population exposée", f"{total_pop_exposed:,}")
+c3.metric("Pluie cumulée", f"{total_rain:.1f} mm")
+
+# ------------------------------------------------------------
+# CALCUL DES INDICATEURS PAR ZONE
+# ------------------------------------------------------------
 zone_metrics = []
 for idx,row in gdf.iterrows():
     poly = row.geometry
@@ -137,21 +150,13 @@ for idx,row in gdf.iterrows():
     try:
         flood_km2 = ee.Number(flood_img.multiply(pixel_area).reduceRegion(ee.Reducer.sum(),ee_poly,100,1e13).get("VV")).divide(1e6).getInfo()
         pop_exposed = int(ee.Number(pop_img.updateMask(flood_img).reduceRegion(ee.Reducer.sum(),ee_poly,100,1e13).get("population")).getInfo())
-        rain_total = float(ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(ee_poly).filterDate(str(start_date),str(end_date)).sum()
-                           .reduceRegion(ee.Reducer.mean(),ee_poly,5000,1e13).get("precipitation").getInfo())
+        rain_total = float(ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(ee_poly).filterDate(str(start_date),str(end_date)).sum().reduceRegion(ee.Reducer.mean(),ee_poly,5000,1e13).get("precipitation").getInfo())
     except: flood_km2=0; pop_exposed=0; rain_total=0
     pct_flood = flood_km2/(poly.area/1e6) if poly.area>0 else 0
     zone_metrics.append({"zone":idx+1,"surface_km2":poly.area/1e6,"flood_km2":flood_km2,
                          "pct_flood":pct_flood*100,"pop_exposed":pop_exposed,"rain_mm":rain_total})
 
 df_metrics = pd.DataFrame(zone_metrics)
-
-st.subheader("📊 Tableau récapitulatif par zone")
-st.dataframe(df_metrics.style.format({"surface_km2":"{:.2f}","flood_km2":"{:.2f}","pct_flood":"{:.1f}%","rain_mm":"{:.1f}","pop_exposed": "{:,}"}))
-
-# Bouton export CSV
-csv = df_metrics.to_csv(index=False).encode('utf-8')
-st.download_button("⬇️ Télécharger le tableau CSV", data=csv, file_name="zone_metrics.csv", mime="text/csv")
 
 # ------------------------------------------------------------
 # CARTE INTERACTIVE AVEC DEGRADÉ
@@ -230,3 +235,20 @@ with st.spinner("Calcul des précipitations journalières..."):
         df_rain['date']=pd.to_datetime(df_rain['date'])
         fig = px.bar(df_rain,x='date',y='rain',title="Précipitations quotidiennes (mm)",color_discrete_sequence=['#00aaff'])
         st.plotly_chart(fig,use_container_width=True)
+
+# ------------------------------------------------------------
+# TABLEAU RECAPITULATIF
+# ------------------------------------------------------------
+st.subheader("📋 Tableau récapitulatif par zone")
+
+# Filtres interactifs
+min_pct = st.slider("Filtrer par % inondée minimum",0,100,0)
+max_pct = st.slider("Filtrer par % inondée maximum",0,100,100)
+df_filtered = df_metrics[(df_metrics.pct_flood>=min_pct)&(df_metrics.pct_flood<=max_pct)]
+
+st.dataframe(df_filtered.style.format({"surface_km2":"{:.2f}","flood_km2":"{:.2f}",
+                                       "pct_flood":"{:.1f}%","rain_mm":"{:.1f}","pop_exposed":"{:,}"}))
+
+# Export CSV
+csv = df_filtered.to_csv(index=False).encode('utf-8')
+st.download_button("⬇️ Télécharger le tableau CSV", data=csv, file_name="zone_metrics_filtered.csv", mime="text/csv")
