@@ -1,7 +1,4 @@
 streamlit
-osmnx
-shapely==2.0.2
 folium
 streamlit-folium
 requests
-networkx
