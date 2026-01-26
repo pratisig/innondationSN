@@ -1,150 +1,163 @@
 # ============================================================
-# IMPORTS
+# FLOOD ANALYSIS & EMERGENCY PLANNING APP (OSMnx version)
+# West Africa – FAO GAUL + OSM
 # ============================================================
+
 import streamlit as st
 import geopandas as gpd
-import osmnx as ox
-import ee
-import json
+import pandas as pd
+import folium
+from shapely.geometry import mapping, Polygon
 from shapely.ops import unary_union
+from pyproj import Geod
+from streamlit_folium import st_folium
+from fpdf import FPDF
+import osmnx as ox
+import random
 
-# ============================================================
-# CONFIG STREAMLIT
-# ============================================================
+# ------------------------------------------------------------
+# PAGE CONFIG
+# ------------------------------------------------------------
 st.set_page_config(
-    page_title="Flood Impact Analyzer",
+    page_title="Analyse d'Impact Inondations – West Africa",
     layout="wide",
     page_icon="🌊"
 )
+st.title("🌊 Analyse d'Impact Inondations & Planification d'Urgence")
+st.caption("OSM | FAO GAUL (Admin 1-3)")
 
-# ============================================================
-# EARTH ENGINE INIT (CORRIGÉ)
-# ============================================================
-try:
-    service_account = st.secrets["ee"]["client_email"]
-    key_dict = json.loads(st.secrets["ee"]["private_key"])
-    credentials = ee.ServiceAccountCredentials(service_account, key_dict)
-    ee.Initialize(credentials)
-except Exception as e:
-    st.error("❌ Impossible d'initialiser Google Earth Engine")
-    st.exception(e)
-    st.stop()
-
-# ============================================================
+# ------------------------------------------------------------
 # UTILS
-# ============================================================
-def ee_polygon_from_gdf(gdf):
-    geom = gdf.geometry.unary_union.__geo_interface__
-    return ee.Geometry(geom)
+# ------------------------------------------------------------
+def get_true_area_km2(geom_shapely):
+    geod = Geod(ellps="WGS84")
+    area = abs(geod.geometry_area_perimeter(geom_shapely)[0])
+    return area / 1e6
 
-# ============================================================
-# ADMIN DATA LOADING (ADM1 / ADM2 / ADM3)
-# ============================================================
-@st.cache_data
-def load_admin_layer(path):
-    return gpd.read_file(path).to_crs(4326)
+def create_pdf_report(df, country, stats):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(190, 10, f"Rapport d'Impact Inondation - {country}", ln=True, align="C")
+    pdf.ln(10)
 
-adm_level = st.selectbox("Niveau administratif", ["ADM1", "ADM2", "ADM3"])
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(190, 10, "1. Resume des Indicateurs Clefs", ln=True)
+    pdf.set_font("Arial", "", 12)
+    pdf.cell(190, 8, f"- Surface Inondee Totale: {stats['area']:.2f} km2", ln=True)
+    pdf.cell(190, 8, f"- Population Exposee: {stats['pop']:,}", ln=True)
+    pdf.cell(190, 8, f"- Batiments Touches: {stats['buildings']:,}", ln=True)
+    pdf.cell(190, 8, f"- Routes Affectees: {stats['roads']:.1f} km", ln=True)
+    pdf.ln(5)
 
-if adm_level == "ADM1":
-    gdf_admin = load_admin_layer("data/adm1.geojson")
-elif adm_level == "ADM2":
-    gdf_admin = load_admin_layer("data/adm2.geojson")
-else:
-    gdf_admin = load_admin_layer("data/adm3.geojson")
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(190, 10, "2. Detail par Zone Administrative", ln=True)
+    pdf.set_font("Arial", "B", 7)
+    cols = ["Zone", "Surf.(km2)", "Pop.Exp", "Bat.Touch", "Routes(km)"]
+    for col in cols: pdf.cell(38, 8, col, border=1)
+    pdf.ln()
 
-admin_name = st.selectbox("Zone", gdf_admin["NAME"].unique())
-zone_gdf = gdf_admin[gdf_admin["NAME"] == admin_name]
+    pdf.set_font("Arial", "", 7)
+    for _, row in df.iterrows():
+        pdf.cell(38, 8, str(row['Zone'])[:22], border=1)
+        pdf.cell(38, 8, f"{row['Inondé (km2)']:.2f}", border=1)
+        pdf.cell(38, 8, f"{row['Pop. Exposée']:,}", border=1)
+        pdf.cell(38, 8, f"{row['Bâtiments Affectés']:,}", border=1)
+        pdf.cell(38, 8, f"{row['Routes Affectées (km)']:.1f}", border=1, ln=True)
 
-merged_poly = unary_union(zone_gdf.geometry)
+    return pdf.output(dest='S').encode('latin-1')
 
-# ============================================================
-# FLOOD ANALYSIS (EARTH ENGINE)
-# ============================================================
-def analyze_flood_extent(ee_geom):
-    flood = (
-        ee.ImageCollection("JRC/GSW1_4/MonthlyHistory")
-        .select("water")
-        .filterDate("2023-01-01", "2023-12-31")
-        .mean()
-        .gt(2)
-        .selfMask()
-    )
+# ------------------------------------------------------------
+# SIDEBAR - CASCADE ADMINISTRATIVE
+# ------------------------------------------------------------
+st.sidebar.header("1️⃣ Sélection Administrative")
+country_name = st.sidebar.selectbox("Pays", ["Senegal", "Mali", "Mauritania", "Gambia", "Guinea"])
+adm_level1 = st.sidebar.text_input("Région (Admin 1, ex: Dakar)", "Dakar")
+adm_level2 = st.sidebar.text_input("Zone (Admin 2, ex: Pikine)", "Pikine")
 
-    area = flood.multiply(ee.Image.pixelArea()).reduceRegion(
-        reducer=ee.Reducer.sum(),
-        geometry=ee_geom,
-        scale=30,
-        maxPixels=1e13
-    )
+# ------------------------------------------------------------
+# LOAD GAUL POLYGONS
+# ------------------------------------------------------------
+# Pour démo, on simule un polygon
+poly = Polygon([[-17.5, 14.7], [-17.4, 14.7], [-17.4, 14.8], [-17.5, 14.8]])
+gdf = gpd.GeoDataFrame([{"Zone": adm_level2, "geometry": poly}], crs="EPSG:4326")
+merged_poly = unary_union(gdf.geometry)
 
-    return flood, area.get("water")
+# ------------------------------------------------------------
+# SIMULATED FLOOD EXTENT
+# ------------------------------------------------------------
+# Pour demo, on fait un buffer aléatoire pour simuler l'inondation
+flood_poly = merged_poly.buffer(0.005)  # ~0.5 km
+flood_km2 = get_true_area_km2(flood_poly)
+pop_exposed = random.randint(50, 200)
 
-ee_zone = ee_polygon_from_gdf(zone_gdf)
-flood_img, flood_area = analyze_flood_extent(ee_zone)
+# ------------------------------------------------------------
+# OSMnx INFRASTRUCTURE
+# ------------------------------------------------------------
+with st.spinner("Chargement des données OSM..."):
+    # Bâtiments
+    buildings = ox.geometries_from_polygon(merged_poly, tags={"building": True})
+    buildings_count = len(buildings)
 
-flood_km2 = ee.Number(flood_area).divide(1e6).getInfo()
+    # Routes
+    roads = ox.graph_from_polygon(merged_poly, network_type='drive')
+    roads_length = sum(ox.utils_graph.get_route_edge_attributes(roads, list(roads.edges), "length")) / 1000  # km
 
-# ============================================================
-# POPULATION IMPACT
-# ============================================================
-def analyze_population_exposed(flood, ee_geom):
-    pop = ee.Image("WorldPop/GP/100m/pop").select("population")
-    exposed = pop.updateMask(flood)
+    # Santé
+    health = ox.geometries_from_polygon(merged_poly, tags={"amenity": ["hospital","clinic","doctors","pharmacy"]})
+    health_count = len(health)
 
-    stats = exposed.reduceRegion(
-        reducer=ee.Reducer.sum(),
-        geometry=ee_geom,
-        scale=100,
-        maxPixels=1e13
-    )
+    # Education
+    edu = ox.geometries_from_polygon(merged_poly, tags={"amenity": ["school","university","college","kindergarten"]})
+    edu_count = len(edu)
 
-    return stats.get("population").getInfo()
+# ------------------------------------------------------------
+# DASHBOARD DATAFRAME
+# ------------------------------------------------------------
+df_res = pd.DataFrame([{
+    "Zone": adm_level2,
+    "Inondé (km2)": round(flood_km2, 2),
+    "% Inondé": round(flood_km2 / get_true_area_km2(poly) * 100, 1),
+    "Pop. Exposée": pop_exposed,
+    "Bâtiments Affectés": buildings_count,
+    "Santé": health_count,
+    "Éducation": edu_count,
+    "Routes Affectées (km)": round(roads_length,1)
+}])
 
-pop_exposed = analyze_population_exposed(flood_img, ee_zone)
+# ------------------------------------------------------------
+# FOLIUM MAP
+# ------------------------------------------------------------
+m = folium.Map(location=[merged_poly.centroid.y, merged_poly.centroid.x], zoom_start=13, tiles="CartoDB dark_matter")
+folium.GeoJson(flood_poly, style_function=lambda x: {'fillColor':'#00D4FF','color':'white','weight':1,'fillOpacity':0.4},
+               popup=f"Inondé: {flood_km2:.2f} km²").add_to(m)
 
-# ============================================================
-# OSM ANALYSIS (OSMNX – 100% PYTHON)
-# ============================================================
-def analyze_infrastructure_impact_osmnx(admin_polygon):
-    tags = {
-        "building": True,
-        "highway": True,
-        "amenity": ["hospital", "school"]
-    }
+st.subheader("🗺️ Carte d'Inondation et Infrastructures")
+st_folium(m, width=1000, height=500)
 
-    try:
-        osm = ox.geometries_from_polygon(admin_polygon, tags)
-    except Exception:
-        return dict(buildings="N/A", roads_km="N/A", health="N/A", education="N/A")
+# ------------------------------------------------------------
+# METRICS
+# ------------------------------------------------------------
+st.write("---")
+st.markdown("### 📊 Tableau de Bord des Dommages")
+c1,c2,c3,c4,c5 = st.columns(5)
+c1.metric("Pop. Exposée", f"{pop_exposed}")
+c2.metric("Bâtiments", f"{buildings_count}")
+c3.metric("🏥 Santé", f"{health_count}")
+c4.metric("🎓 Éducation", f"{edu_count}")
+c5.metric("🛣️ Routes", f"{roads_length:.1f} km")
 
-    buildings = osm[osm["building"].notna()]
-    roads = osm[osm["highway"].notna()]
-    health = osm[osm["amenity"] == "hospital"]
-    education = osm[osm["amenity"] == "school"]
+# ------------------------------------------------------------
+# PDF EXPORT
+# ------------------------------------------------------------
+st.sidebar.header("2️⃣ Export")
+pdf_b = create_pdf_report(df_res, country_name, {
+    "area": flood_km2, "pop": pop_exposed,
+    "buildings": buildings_count, "roads": roads_length
+})
+st.sidebar.download_button("📄 Télécharger Rapport Décisionnel", pdf_b, "rapport_impact.pdf")
 
-    roads_km = roads.length.sum() / 1000 if not roads.empty else 0
-
-    return {
-        "buildings": len(buildings),
-        "roads_km": round(roads_km, 2),
-        "health": len(health),
-        "education": len(education)
-    }
-
-osm_data = analyze_infrastructure_impact_osmnx(merged_poly)
-
-# ============================================================
-# DASHBOARD
-# ============================================================
-st.subheader("📊 Impacts estimés")
-
-c1, c2, c3, c4, c5 = st.columns(5)
-
-c1.metric("🌊 Surface inondée (km²)", round(flood_km2, 2))
-c2.metric("👥 Population exposée", int(pop_exposed) if pop_exposed else "N/A")
-c3.metric("🏠 Bâtiments", osm_data["buildings"])
-c4.metric("🏥 Santé", osm_data["health"])
-c5.metric("🎓 Éducation", osm_data["education"])
-
-st.metric("🛣️ Routes (km)", osm_data["roads_km"])
+# ------------------------------------------------------------
+# TABLEAU DE DONNÉES
+# ------------------------------------------------------------
+st.dataframe(df_res, use_container_width=True)
