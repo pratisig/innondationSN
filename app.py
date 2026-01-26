@@ -203,15 +203,19 @@ bounds = gdf.total_bounds
 m = folium.Map(location=[(bounds[1]+bounds[3])/2, (bounds[0]+bounds[2])/2], zoom_start=10, tiles="CartoDB positron")
 
 # Overlay Inondations
-flood_mapid = flood_img.getMapId({'min': 0, 'max': 1, 'palette': ['#0000FF']})
-folium.TileLayer(
-    tiles=flood_mapid['tile_fetcher'].url_format,
-    attr='Google Earth Engine - Sentinel-1',
-    name='Zones Inondées',
-    overlay=True,
-    control=True,
-    opacity=0.7
-).add_to(m)
+try:
+    flood_mapid = flood_img.getMapId({'min': 0, 'max': 1, 'palette': ['#0000FF']})
+    folium.TileLayer(
+        tiles=flood_mapid['tile_fetcher'].url_format,
+        attr='Google Earth Engine - Sentinel-1',
+        name='Zones Inondées',
+        overlay=True,
+        control=True,
+        opacity=0.7
+    ).add_to(m)
+except Exception as e:
+    st.warning(f"⚠️ Erreur lors du rendu de la couche satellite : La zone est peut-être trop complexe ou le calcul trop lourd pour l'affichage en direct. Essayez une zone plus petite.")
+    print(f"Erreur GEE MapId: {e}")
 
 # Ajout du GeoJSON original pour les popups
 folium.GeoJson(
