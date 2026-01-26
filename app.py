@@ -180,11 +180,12 @@ def analyze_infrastructure_impact(flood_img, aoi_ee):
     flood_vec = flood_img.reduceToVectors(geometry=aoi_ee, scale=100, eightConnected=True)
     
     # Extraction des bâtiments depuis la collection OSM combined
-    buildings = OSM_FEATURES.filterBounds(aoi_ee).filter(ee.Filter.isNotNull(['building']))
+    # Correction : Correction de l'appel ee.Filter.isNotNull qui attend un string, pas une liste
+    buildings = OSM_FEATURES.filterBounds(aoi_ee).filter(ee.Filter.isNotNull('building'))
     affected_buildings = buildings.filterBounds(flood_vec)
     
     # Extraction des routes (clé 'highway')
-    roads = OSM_FEATURES.filterBounds(aoi_ee).filter(ee.Filter.isNotNull(['highway']))
+    roads = OSM_FEATURES.filterBounds(aoi_ee).filter(ee.Filter.isNotNull('highway'))
     affected_roads = roads.filterBounds(flood_vec)
     
     return affected_buildings, affected_roads
