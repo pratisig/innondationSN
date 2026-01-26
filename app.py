@@ -45,74 +45,65 @@ def init_gee():
 init_gee()
 
 # ------------------------------------------------------------
-# FILE UPLOAD & EE GEOMETRY CONVERSION
+# CONVERSION SHAPELY -> EARTH ENGINE (FIXED)
 # ------------------------------------------------------------
-st.sidebar.header("1️⃣ Zone d’étude")
+def shapely_to_ee(poly):
+    """
+    Convertit une géométrie Shapely (Polygon ou MultiPolygon) en 
+    géométrie Google Earth Engine en utilisant le standard GeoJSON.
+    """
+    # L'interface __geo_interface__ fournit le dictionnaire GeoJSON
+    geojson = poly.__geo_interface__
+    
+    if geojson['type'] == 'Polygon':
+        return ee.Geometry.Polygon(geojson['coordinates'])
+    elif geojson['type'] == 'MultiPolygon':
+        return ee.Geometry.MultiPolygon(geojson['coordinates'])
+    else:
+        # Gérer les autres types (Point, LineString) si nécessaire
+        coords = geojson['coordinates']
+        return ee.Geometry(geojson)
+
+# ------------------------------------------------------------
+# LOGIQUE DE CHARGEMENT ET TRAITEMENT
+# ------------------------------------------------------------
+
+init_gee()
+
+st.title("🌊 Analyse des Inondations")
+
 uploaded_file = st.sidebar.file_uploader(
     "Charger une zone (GeoJSON / SHP ZIP / KML)",
     type=["geojson", "kml", "zip"]
 )
 
-if not uploaded_file:
-    st.info("Veuillez charger une zone géographique pour commencer.")
-    st.stop()
+if uploaded_file:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        file_path = os.path.join(tmpdir, uploaded_file.name)
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
 
-with tempfile.TemporaryDirectory() as tmpdir:
-    file_path = os.path.join(tmpdir, uploaded_file.name)
-    with open(file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+        try:
+            # Chargement selon l'extension
+            if uploaded_file.name.endswith(".zip"):
+                with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                    zip_ref.extractall(tmpdir)
+                shp_files = [f for f in os.listdir(tmpdir) if f.endswith(".shp")]
+                gdf = gpd.read_file(os.path.join(tmpdir, shp_files[0]))
+            else:
+                gdf = gpd.read_file(file_path)
 
-    # Gestion des fichiers shapefile zip
-    if uploaded_file.name.endswith(".zip"):
-        with zipfile.ZipFile(file_path, 'r') as zip_ref:
-            zip_ref.extractall(tmpdir)
-        shp_files = [f for f in os.listdir(tmpdir) if f.endswith(".shp")]
-        if not shp_files:
-            st.error("Aucun fichier .shp trouvé dans le zip.")
-            st.stop()
-        file_path = os.path.join(tmpdir, shp_files[0])
-        gdf = gpd.read_file(file_path)
-    elif uploaded_file.name.endswith(".geojson"):
-        gdf = gpd.read_file(file_path, driver="GeoJSON")
-    elif uploaded_file.name.endswith(".kml"):
-        gdf = gpd.read_file(file_path, driver="KML")
-    else:
-        st.error("Format de fichier non supporté.")
-        st.stop()
+            # Vérification de la géométrie
+            if gdf.empty:
+                st.error("Le fichier est vide.")
+                st.stop()
 
-# ------------------------------------------------------------
-# Convert Shapely geometry to EE Geometry
-# ------------------------------------------------------------
-def shapely_to_ee(poly):
-    if isinstance(poly, Polygon):
-        coords = [list(poly.exterior.coords)]
-        for interior in poly.interiors:
-            coords.append(list(interior.coords))
-    elif isinstance(poly, MultiPolygon):
-        coords = []
-        for p in poly.geoms:
-            part = [list(p.exterior.coords)]
-            for interior in p.interiors:
-                part.append(list(interior.coords))
-            coords.append(part)
-    else:
-        st.error(f"Type de géométrie non supporté: {type(poly)}. Veuillez charger un Polygon ou MultiPolygon.")
-        st.stop()
-
-    # Assurer l'ordre [lon, lat]
-    def swap_xy(ring):
-        return [(x, y) for x, y in ring]
-
-    if isinstance(poly, Polygon):
-        coords = [swap_xy(ring) for ring in coords]
-    else:
-        coords = [[swap_xy(ring) for ring in part] for part in coords]
-
-    return ee.Geometry.Polygon(coords)
-
-poly = gdf.geometry.iloc[0]
-geom = shapely_to_ee(poly)
-st.success("✅ Zone d’étude chargée et convertie avec succès.")
+            # Union des géométries pour obtenir la zone d'étude globale
+            # Cela gère les fichiers avec plusieurs lignes (ex: plusieurs communes)
+            merged_poly = gdf.geometry.unary_union
+            geom = shapely_to_ee(merged_poly)
+            
+            st.success("✅ Géométrie convertie avec succès pour Google Earth Engine.")
 
 # ------------------------------------------------------------
 # DATE SELECTION
