@@ -103,7 +103,8 @@ with tempfile.TemporaryDirectory() as tmpdir:
         st.stop()
 
 # Création de la géométrie globale pour GEE
-merged_poly = gdf.geometry.unary_union
+# Simplification légère (0.001 deg ~ 100m) pour éviter les erreurs de payload trop lourd
+merged_poly = gdf.geometry.unary_union.simplify(0.001, preserve_topology=True)
 geom = shapely_to_ee(merged_poly)
 st.success(f"✅ Zone d’étude chargée : {len(gdf)} entité(s) détectée(s).")
 
@@ -164,19 +165,24 @@ with st.spinner("Analyse satellite Sentinel-1 en cours..."):
 pixel_area = ee.Image.pixelArea()
 
 # On regroupe les réductions pour éviter plusieurs .getInfo()
-stats = ee.Dictionary({
-    'flood_km2': flood_img.multiply(pixel_area).reduceRegion(
-        reducer=ee.Reducer.sum(), geometry=geom, scale=30, maxPixels=1e13
-    ).get("VV"),
-    'pop_exposed': ee.ImageCollection("WorldPop/GP/100m/pop").filterDate("2020-01-01", "2020-12-31").mean()
-        .updateMask(flood_img)
-        .reduceRegion(reducer=ee.Reducer.sum(), geometry=geom, scale=100, maxPixels=1e13)
-        .get("population"),
-    'rain_total': ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
-        .filterBounds(geom).filterDate(str(start_date), str(end_date)).sum()
-        .reduceRegion(reducer=ee.Reducer.mean(), geometry=geom, scale=5000, maxPixels=1e13)
-        .get("precipitation")
-}).getInfo()
+# Ajout d'un Try/Except pour gérer les timeouts ou erreurs de calcul
+try:
+    stats = ee.Dictionary({
+        'flood_km2': flood_img.multiply(pixel_area).reduceRegion(
+            reducer=ee.Reducer.sum(), geometry=geom, scale=100, maxPixels=1e13
+        ).get("VV"),
+        'pop_exposed': ee.ImageCollection("WorldPop/GP/100m/pop").filterDate("2020-01-01", "2020-12-31").mean()
+            .updateMask(flood_img)
+            .reduceRegion(reducer=ee.Reducer.sum(), geometry=geom, scale=100, maxPixels=1e13)
+            .get("population"),
+        'rain_total': ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+            .filterBounds(geom).filterDate(str(start_date), str(end_date)).sum()
+            .reduceRegion(reducer=ee.Reducer.mean(), geometry=geom, scale=5000, maxPixels=1e13)
+            .get("precipitation")
+    }).getInfo()
+except Exception as e:
+    st.warning(f"⚠️ Impossible de calculer les statistiques globales (zone trop grande ou complexe). Erreur : {e}")
+    stats = {}
 
 flood_area_val = (stats.get('flood_km2') or 0) / 1e6
 pop_val = int(stats.get('pop_exposed') or 0)
@@ -225,15 +231,18 @@ st.subheader("📈 Dynamique des précipitations (CHIRPS)")
 
 @st.cache_data
 def get_rain_series(aoi_serialized, start, end):
-    aoi = ee.Geometry(aoi_serialized)
-    chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(aoi).filterDate(str(start), str(end))
-    
-    def extract_val(img):
-        val = img.reduceRegion(reducer=ee.Reducer.mean(), geometry=aoi, scale=5000).get('precipitation')
-        return ee.Feature(None, {'date': img.date().format('YYYY-MM-dd'), 'rain': val})
+    try:
+        aoi = ee.Geometry(aoi_serialized)
+        chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(aoi).filterDate(str(start), str(end))
+        
+        def extract_val(img):
+            val = img.reduceRegion(reducer=ee.Reducer.mean(), geometry=aoi, scale=5000).get('precipitation')
+            return ee.Feature(None, {'date': img.date().format('YYYY-MM-dd'), 'rain': val})
 
-    fc = chirps.map(extract_val).getInfo()
-    return pd.DataFrame([f['properties'] for f in fc['features']])
+        fc = chirps.map(extract_val).getInfo()
+        return pd.DataFrame([f['properties'] for f in fc['features']])
+    except Exception:
+        return pd.DataFrame()
 
 with st.spinner("Génération de la courbe de pluie..."):
     df_rain = get_rain_series(geom.getInfo(), start_date, end_date)
