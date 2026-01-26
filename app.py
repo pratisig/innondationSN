@@ -1,5 +1,5 @@
 # ============================================================
-# FLOOD IMPACT ASSESSMENT APP – VERSION AVANCÉE
+# FLOOD IMPACT ASSESSMENT PRO – STABLE STREAMLIT
 # ============================================================
 
 import streamlit as st
@@ -8,17 +8,17 @@ import pandas as pd
 import numpy as np
 import folium
 import ee
-import geemap.foliumap as geemap
 import osmnx as ox
-from shapely.geometry import shape
+
 from shapely.ops import unary_union
-from pyproj import CRS
 from datetime import datetime
+from pyproj import CRS
+
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 
 # ============================================================
-# INITIALISATION
+# CONFIG
 # ============================================================
 
 st.set_page_config(
@@ -30,18 +30,13 @@ st.set_page_config(
 ee.Initialize()
 
 # ============================================================
-# SIDEBAR – PARAMÈTRES
+# SIDEBAR
 # ============================================================
 
-st.sidebar.title("⚙️ Paramètres d’analyse")
+st.sidebar.title("⚙️ Paramètres")
 
-start_date = st.sidebar.date_input("📅 Date début", datetime(2024, 8, 1))
-end_date = st.sidebar.date_input("📅 Date fin", datetime(2024, 9, 30))
-
-scenario = st.sidebar.selectbox(
-    "📊 Scénario",
-    ["Crue actuelle", "Crue décennale", "Crue extrême"]
-)
+start_date = st.sidebar.date_input("📅 Début", datetime(2024, 8, 1))
+end_date = st.sidebar.date_input("📅 Fin", datetime(2024, 9, 30))
 
 uploaded_file = st.sidebar.file_uploader(
     "📂 Zone d’étude (GeoJSON / SHP / KML)",
@@ -49,22 +44,21 @@ uploaded_file = st.sidebar.file_uploader(
 )
 
 # ============================================================
-# LECTURE ZONE
+# ZONE
 # ============================================================
 
-if uploaded_file:
-    gdf = gpd.read_file(uploaded_file)
-    gdf = gdf.to_crs(epsg=3857)  # PROJECTION MÉTRIQUE
-    gdf["zone_id"] = gdf.index + 1
-    gdf["zone_name"] = gdf.get("name", gdf["zone_id"].apply(lambda x: f"Zone {x}"))
+if not uploaded_file:
+    st.warning("Veuillez charger une zone.")
+    st.stop()
 
-    total_geom = unary_union(gdf.geometry)
-    total_area_km2 = total_geom.area / 1e6
+gdf = gpd.read_file(uploaded_file)
+gdf = gdf.to_crs(epsg=3857)
 
-    st.success(f"✅ Zone chargée – Surface totale : {total_area_km2:.2f} km²")
+if "name" not in gdf.columns:
+    gdf["name"] = [f"Zone {i+1}" for i in range(len(gdf))]
 
 # ============================================================
-# FONCTIONS GEE
+# EARTH ENGINE FUNCTIONS
 # ============================================================
 
 def get_flood_image(start, end):
@@ -77,7 +71,7 @@ def get_flood_image(start, end):
         .lt(-15)
     )
 
-def zonal_sum(img, geom):
+def zonal_area(img, geom):
     return img.multiply(ee.Image.pixelArea()).reduceRegion(
         reducer=ee.Reducer.sum(),
         geometry=geom,
@@ -91,7 +85,7 @@ def get_population(geom):
         ee.Reducer.sum(), geom, 100, maxPixels=1e13
     ).getInfo()["population"]
 
-def get_rainfall(geom, start, end):
+def get_rain(geom, start, end):
     rain = ee.ImageCollection("NASA/POWER/Daily").select("PRECTOT").filterDate(
         str(start), str(end)
     )
@@ -99,83 +93,70 @@ def get_rainfall(geom, start, end):
         ee.Reducer.mean(), geom, 5000
     ).getInfo()["PRECTOT"]
 
-def get_ndvi_loss(geom):
-    s2 = ee.ImageCollection("COPERNICUS/S2_SR").filterBounds(geom)
-    before = s2.filterDate("2024-06-01", "2024-07-15").median()
-    after = s2.filterDate("2024-08-15", "2024-09-30").median()
-
-    ndvi_before = before.normalizedDifference(["B8", "B4"])
-    ndvi_after = after.normalizedDifference(["B8", "B4"])
-
-    loss = ndvi_before.subtract(ndvi_after)
-    return loss.reduceRegion(
-        ee.Reducer.mean(), geom, 20, maxPixels=1e13
-    ).getInfo()
-
 # ============================================================
 # ANALYSE
 # ============================================================
 
-if uploaded_file:
+flood_img = get_flood_image(start_date, end_date)
 
-    flood_img = get_flood_image(start_date, end_date)
+records = []
 
-    results = []
+for _, row in gdf.iterrows():
+    geom_ee = ee.Geometry(row.geometry.__geo_interface__)
 
-    for _, row in gdf.iterrows():
-        geom_ee = ee.Geometry(row.geometry.__geo_interface__)
+    total_km2 = row.geometry.area / 1e6
 
-        flood_area = zonal_sum(flood_img, geom_ee)
-        flood_km2 = flood_area["VV"] / 1e6 if flood_area["VV"] else 0
+    flood = zonal_area(flood_img, geom_ee)
+    flood_km2 = flood["VV"] / 1e6 if flood and "VV" in flood else 0
 
-        total_km2 = row.geometry.area / 1e6
-        flood_pct = (flood_km2 / total_km2) * 100 if total_km2 > 0 else 0
+    flood_pct = (flood_km2 / total_km2) * 100 if total_km2 > 0 else 0
 
-        pop_total = get_population(geom_ee)
-        pop_exposed = pop_total * (flood_pct / 100)
+    pop_total = get_population(geom_ee)
+    pop_exposed = int(pop_total * flood_pct / 100)
 
-        rain = get_rainfall(geom_ee, start_date, end_date)
-        ndvi_loss = get_ndvi_loss(geom_ee)
+    rain = get_rain(geom_ee, start_date, end_date)
 
-        # OSM INFRASTRUCTURES
-        poly_wgs = gpd.GeoSeries([row.geometry], crs=3857).to_crs(4326).iloc[0]
-        tags = {"amenity": True, "highway": True, "building": True}
-        osm = ox.geometries_from_polygon(poly_wgs, tags)
-        infra_count = len(osm)
+    # OSM
+    poly_wgs = gpd.GeoSeries([row.geometry], crs=3857).to_crs(4326).iloc[0]
+    osm = ox.geometries_from_polygon(
+        poly_wgs,
+        tags={"amenity": True, "highway": True, "building": True}
+    )
 
-        priority_index = (
-            flood_pct * 0.4 +
-            (pop_exposed / max(pop_total, 1)) * 30 +
-            infra_count * 0.05
-        )
+    infra_count = len(osm)
 
-        results.append({
-            "Zone": row.zone_name,
-            "Surface totale (km²)": total_km2,
-            "Surface inondée (km²)": flood_km2,
-            "% inondée": flood_pct,
-            "Population totale": int(pop_total),
-            "Population exposée": int(pop_exposed),
-            "Pluie cumulée (mm)": rain,
-            "Infrastructures exposées": infra_count,
-            "NDVI perte": ndvi_loss,
-            "Indice priorité": priority_index
-        })
+    priority = (
+        flood_pct * 0.5 +
+        (pop_exposed / max(pop_total, 1)) * 30 +
+        infra_count * 0.05
+    )
 
-    df = pd.DataFrame(results)
+    records.append({
+        "Zone": row["name"],
+        "Surface totale (km²)": round(total_km2, 2),
+        "Surface inondée (km²)": round(flood_km2, 2),
+        "% inondée": round(flood_pct, 1),
+        "Population totale": int(pop_total),
+        "Population exposée": pop_exposed,
+        "Pluie cumulée (mm)": round(rain, 1),
+        "Infrastructures exposées": infra_count,
+        "Indice priorité": round(priority, 1)
+    })
+
+df = pd.DataFrame(records)
 
 # ============================================================
-# INDICATEURS AVANT TABLE
+# INDICATEURS
 # ============================================================
 
 st.subheader("📊 Indicateurs clés")
 
-col1, col2, col3, col4 = st.columns(4)
+c1, c2, c3, c4 = st.columns(4)
 
-col1.metric("🌊 Surface inondée totale (km²)", df["Surface inondée (km²)"].sum())
-col2.metric("👥 Population exposée", df["Population exposée"].sum())
-col3.metric("🛣️ Infrastructures exposées", df["Infrastructures exposées"].sum())
-col4.metric("🧠 Zone prioritaire", df.sort_values("Indice priorité", ascending=False).iloc[0]["Zone"])
+c1.metric("🌊 Surface inondée (km²)", df["Surface inondée (km²)"].sum())
+c2.metric("👥 Population exposée", df["Population exposée"].sum())
+c3.metric("🏗️ Infrastructures exposées", df["Infrastructures exposées"].sum())
+c4.metric("🧠 Zone prioritaire", df.sort_values("Indice priorité", ascending=False).iloc[0]["Zone"])
 
 # ============================================================
 # CARTE
@@ -183,53 +164,69 @@ col4.metric("🧠 Zone prioritaire", df.sort_values("Indice priorité", ascendin
 
 st.subheader("🗺️ Carte interactive")
 
-m = geemap.Map()
-m.add_basemap("SATELLITE")
-m.addLayer(flood_img.updateMask(flood_img), {"palette": ["blue"]}, "Inondation")
+center = gdf.to_crs(4326).unary_union.centroid
+m = folium.Map(location=[center.y, center.x], zoom_start=8, tiles="CartoDB positron")
 
+# Flood layer
+flood_map = flood_img.getMapId({"palette": ["0000FF"]})
+folium.TileLayer(
+    tiles=flood_map["tile_fetcher"].url_format,
+    attr="Sentinel-1 Flood",
+    name="Inondation",
+    overlay=True
+).add_to(m)
+
+# Polygons + popup
 for _, row in gdf.iterrows():
-    popup = f"""
-    <b>{row.zone_name}</b><br>
-    Surface: {df.loc[df.Zone == row.zone_name, "Surface totale (km²)"].values[0]:.2f} km²<br>
-    Inondée: {df.loc[df.Zone == row.zone_name, "Surface inondée (km²)"].values[0]:.2f} km²<br>
-    Population: {df.loc[df.Zone == row.zone_name, "Population totale"].values[0]}<br>
-    Population exposée: {df.loc[df.Zone == row.zone_name, "Population exposée"].values[0]}
-    """
-    folium.GeoJson(row.geometry, popup=popup).add_to(m)
+    info = df[df.Zone == row["name"]].iloc[0]
 
-m.to_streamlit(height=600)
+    popup = f"""
+    <b>{row['name']}</b><br>
+    Surface totale: {info['Surface totale (km²)']} km²<br>
+    Surface inondée: {info['Surface inondée (km²)']} km²<br>
+    % inondée: {info['% inondée']} %<br>
+    Population: {info['Population totale']}<br>
+    Population exposée: {info['Population exposée']}<br>
+    Infrastructures: {info['Infrastructures exposées']}
+    """
+
+    folium.GeoJson(
+        row.geometry.to_crs(4326),
+        popup=popup,
+        style_function=lambda x: {"fillOpacity": 0.1, "color": "red"}
+    ).add_to(m)
+
+folium.LayerControl().add_to(m)
+st.components.v1.html(m._repr_html_(), height=600)
 
 # ============================================================
-# TABLE RÉCAPITULATIVE + FILTRES
+# TABLE + FILTRES
 # ============================================================
 
 st.subheader("📋 Tableau récapitulatif")
 
 min_pct = st.slider("Filtrer % inondée", 0, 100, 0)
-df_filtered = df[df["% inondée"] >= min_pct]
-
-st.dataframe(df_filtered)
+st.dataframe(df[df["% inondée"] >= min_pct])
 
 st.download_button(
     "⬇️ Télécharger CSV",
-    df_filtered.to_csv(index=False),
-    "flood_analysis.csv",
-    "text/csv"
+    df.to_csv(index=False),
+    "flood_results.csv"
 )
 
 # ============================================================
-# RAPPORT PDF
+# PDF
 # ============================================================
 
 if st.button("📄 Générer rapport PDF"):
-    pdf_path = "/tmp/rapport_inondation.pdf"
-    doc = SimpleDocTemplate(pdf_path)
+    path = "/tmp/rapport_flood.pdf"
+    doc = SimpleDocTemplate(path)
     styles = getSampleStyleSheet()
     story = [Paragraph("Rapport d’analyse des inondations", styles["Title"])]
 
     for _, r in df.iterrows():
-        story.append(Spacer(1, 12))
+        story.append(Spacer(1, 10))
         story.append(Paragraph(str(r.to_dict()), styles["Normal"]))
 
     doc.build(story)
-    st.download_button("📥 Télécharger PDF", open(pdf_path, "rb"), "rapport.pdf")
+    st.download_button("📥 Télécharger PDF", open(path, "rb"), "rapport.pdf")
