@@ -87,6 +87,8 @@ else:
 with st.spinner("Chargement de la géométrie..."):
     # Limiter le nombre de features pour la performance de l'UI
     gdf = gpd.GeoDataFrame.from_features(final_aoi_fc.getInfo(), crs="EPSG:4326")
+    # On s'assure que l'index est propre pour la correspondance
+    gdf = gdf.reset_index(drop=True)
     merged_poly = unary_union(gdf.geometry)
     geom_ee = ee.Geometry(mapping(merged_poly))
 
@@ -152,7 +154,7 @@ def compute_metrics(gdf_json, start, end):
     features = []
     for idx, row in gdf.iterrows():
         f = ee.Feature(ee.Geometry(mapping(row.geometry)), {
-            'id': idx, 'nom': str(row[label_col]), 'area_km2': get_true_area_km2(row.geometry)
+            'orig_index': idx, 'nom': str(row[label_col]), 'area_km2': get_true_area_km2(row.geometry)
         })
         features.append(f)
     fc = ee.FeatureCollection(features)
@@ -176,6 +178,7 @@ with st.spinner("Calcul des statistiques d'impact..."):
         f_km2 = (p.get('f_area', 0)) / 1e6
         area_total = p.get('area_km2', 1)
         rows.append({
+            "orig_index": p['orig_index'],
             "Zone": p['nom'],
             "Surface Totale (km2)": area_total,
             "Inondé (km2)": f_km2,
@@ -214,7 +217,8 @@ add_ee_layer(bldg_img.updateMask(flood_img), {'palette':['#FF0000']}, "Bâtiment
 
 # Polygons avec couleur selon l'impact
 for _, r in df.iterrows():
-    orig_geom = gdf[gdf[label_col] == r['Zone']].geometry.values[0]
+    # Utilisation de l'index d'origine pour éviter les erreurs de sélection par nom
+    orig_geom = gdf.loc[r['orig_index']].geometry
     color = "red" if r['% Inondé'] > 10 else "orange" if r['% Inondé'] > 2 else "green"
     folium.GeoJson(
         orig_geom,
@@ -229,7 +233,9 @@ st_folium(m, width="100%", height=500)
 # TABLE & DOWNLOAD
 # ------------------------------------------------------------
 st.subheader("📋 Détails analytiques")
-st.dataframe(df.style.format({
+# On retire la colonne technique d'index pour l'affichage utilisateur
+df_display = df.drop(columns=['orig_index'])
+st.dataframe(df_display.style.format({
     "Surface Totale (km2)": "{:.2f}",
     "Inondé (km2)": "{:.2f}",
     "% Inondé": "{:.1f}%",
@@ -237,4 +243,4 @@ st.dataframe(df.style.format({
     "Bâtiments Impactés": "{:,}"
 }), use_container_width=True)
 
-st.download_button("⬇️ Exporter les données (CSV)", df.to_csv(index=False), "rapport_impact_admin.csv")
+st.download_button("⬇️ Exporter les données (CSV)", df_display.to_csv(index=False), "rapport_impact_admin.csv")
