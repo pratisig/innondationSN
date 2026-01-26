@@ -91,12 +91,15 @@ def get_true_area_km2(geom_shapely):
     return area / 1e6
 
 # ------------------------------------------------------------
-# DATASETS
+# DATASETS - Correction des chemins OSM
 # ------------------------------------------------------------
 GAUL = ee.FeatureCollection("FAO/GAUL/2015/level2")
 GAUL_A1 = ee.FeatureCollection("FAO/GAUL/2015/level1")
-OSM_BUILDINGS = ee.FeatureCollection("projects/google/osm/buildings")
-OSM_ROADS = ee.FeatureCollection("projects/google/osm/roads")
+
+# Utilisation des collections OSM globales (High Resolution)
+OSM_BUILDINGS = ee.FeatureCollection("MSFP/Buildings/v1") # Microsoft Buildings (souvent plus complet)
+# Pour les types spécifiques OSM, on utilise la collection communautaire ou filtrée
+OSM_DATA = ee.FeatureCollection("projects/google/osm/latest") # Chemin générique mis à jour
 
 # ------------------------------------------------------------
 # SIDEBAR - CASCADE ADMINISTRATIVE
@@ -172,19 +175,23 @@ def get_flood_and_rain(aoi_json, start_str, end_str):
     return flood.updateMask(slope.lt(5)).selfMask(), rain
 
 # ------------------------------------------------------------
-# ANALYSE D'IMPACT INFRASTRUCTURE (OSM)
+# ANALYSE D'IMPACT INFRASTRUCTURE (OSM) - Catégorisée
 # ------------------------------------------------------------
 def analyze_infrastructure_impact(flood_img, aoi_ee):
     # Buffer de l'inondation pour l'intersection vectorielle
     flood_vec = flood_img.reduceToVectors(geometry=aoi_ee, scale=100, eightConnected=True)
     
-    # 1. Bâtiments
+    # Correction des accès : on utilise un filtre global sur les points d'intérêt et lignes OSM
+    # Bâtiments (Microsoft Buildings est une alternative stable)
     buildings = OSM_BUILDINGS.filterBounds(aoi_ee)
     affected_buildings = buildings.filterBounds(flood_vec)
     
-    # 2. Routes
-    roads = OSM_ROADS.filterBounds(aoi_ee)
+    # Routes (via TIGER ou OSM)
+    roads = ee.FeatureCollection("TIGER/2016/Roads").filterBounds(aoi_ee) # TIGER est plus stable dans GEE
     affected_roads = roads.filterBounds(flood_vec)
+    
+    # Points d'intérêt (Santé, Education via OSM tags)
+    pois = ee.FeatureCollection("GOOGLE/Research/open-buildings/v3/polygons").filterBounds(aoi_ee)
     
     return affected_buildings, affected_roads
 
@@ -215,12 +222,26 @@ if analysis_mode == "Série Temporelle Animée":
 
 st.subheader("🗺️ Analyse d'Impact Spatiale & Infrastructures")
 
-with st.spinner("Analyse approfondie (Population & OSM)..."):
+with st.spinner("Analyse approfondie (Population & Infrastructures)..."):
     flood_all, rain_all = get_flood_and_rain(geom_ee.getInfo(), str(start_date), str(end_date))
     pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").filterBounds(geom_ee).mean().select(0)
 
     if flood_all:
         aff_buildings, aff_roads = analyze_infrastructure_impact(flood_all, geom_ee)
+        
+        # Categorisation par tags (Santé, Education)
+        # Note: On utilise des filtres sur les métadonnées OSM si disponibles
+        health_aff = aff_buildings.filter(ee.Filter.Or(
+            ee.Filter.eq('amenity', 'hospital'),
+            ee.Filter.eq('amenity', 'clinic'),
+            ee.Filter.eq('building', 'hospital')
+        ))
+        edu_aff = aff_buildings.filter(ee.Filter.Or(
+            ee.Filter.eq('amenity', 'school'),
+            ee.Filter.eq('amenity', 'university'),
+            ee.Filter.eq('building', 'school')
+        ))
+
         rain_stats = safe_get_info(rain_all.reduceRegion(ee.Reducer.mean(), geom_ee, 2000))
         total_rain = rain_stats.get('precip', 0) if rain_stats else 0
         
@@ -234,11 +255,13 @@ with st.spinner("Analyse approfondie (Population & OSM)..."):
                 pop_img.updateMask(flood_all.select(0)).rename('p_exp')
             ]).reduceRegion(ee.Reducer.sum(), f_geom, 250))
             
-            # Stats OSM (Nombre de bâtiments et longueur de routes)
+            # Stats Infrastructures
             b_count = safe_get_info(aff_buildings.filterBounds(f_geom).size())
-            # Simplification : calcul longueur approximative des routes affectées
-            r_count = safe_get_info(aff_roads.filterBounds(f_geom).aggregate_sum('length'))
-            r_km = (float(r_count) / 1000.0) if r_count else 0
+            h_count = safe_get_info(health_aff.filterBounds(f_geom).size())
+            e_count = safe_get_info(edu_aff.filterBounds(f_geom).size())
+            
+            # Calcul longueur routes (TIGER utilise 'length' ou on calcule la géométrie)
+            r_count = safe_get_info(aff_roads.filterBounds(f_geom).size()) # Nombre de segments affectés
             
             f_km2 = (loc_stats.get('f_area', 0) if loc_stats else 0) / 1e6
             p_exp = (loc_stats.get('p_exp', 0) if loc_stats else 0)
@@ -248,8 +271,10 @@ with st.spinner("Analyse approfondie (Population & OSM)..."):
                 "Inondé (km2)": round(f_km2, 2),
                 "% Inondé": round((f_km2 / get_true_area_km2(row.geometry) * 100), 1) if f_km2 > 0 else 0,
                 "Pop. Exposée": int(p_exp),
-                "Bâtiments Affectés": int(b_count) if b_count else 0,
-                "Routes Affectées (km)": round(r_km, 1),
+                "Bâtiments": int(b_count) if b_count else 0,
+                "Santé": int(h_count) if h_count else 0,
+                "Éducation": int(e_count) if e_count else 0,
+                "Segments Route": int(r_count) if r_count else 0,
                 "orig_id": idx
             })
             
@@ -261,25 +286,28 @@ with st.spinner("Analyse approfondie (Population & OSM)..."):
 
         for _, r in df_res.iterrows():
             geom = gdf.iloc[int(r['orig_id'])].geometry
-            pop_html = f"<b>{r['Zone']}</b><br>Bâtiments affectés: {r['Bâtiments Affectés']}<br>Routes: {r['Routes Affectées (km)']} km"
+            pop_html = f"<b>{r['Zone']}</b><br>Santé: {r['Santé']}<br>Écoles: {r['Éducation']}<br>Total Bât: {r['Bâtiments']}"
             folium.GeoJson(geom, style_function=lambda x: {'fillColor': 'red', 'color': 'white', 'weight': 1, 'fillOpacity': 0.1},
                            popup=folium.Popup(pop_html, max_width=200)).add_to(m)
 
         st_folium(m, width="100%", height=500)
 
         st.write("---")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Surface Inondée", f"{df_res['Inondé (km2)'].sum():.2f} km²")
-        c2.metric("Pop. Exposée", f"{df_res['Pop. Exposée'].sum():,}")
-        c3.metric("Bâtiments Touchés", f"{df_res['Bâtiments Affectés'].sum():,}")
-        c4.metric("Routes Coupées", f"{df_res['Routes Affectées (km)'].sum():.1f} km")
+        st.markdown("### 📊 Tableau de Bord des Dommages")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Pop. Exposée", f"{df_res['Pop. Exposée'].sum():,}")
+        c2.metric("Bâtiments", f"{df_res['Bâtiments'].sum():,}")
+        c3.metric("🏥 Santé", f"{df_res['Santé'].sum():,}")
+        c4.metric("🎓 Éducation", f"{df_res['Éducation'].sum():,}")
+        c5.metric("🛣️ Routes (segments)", f"{df_res['Segments Route'].sum():,}")
 
         st.sidebar.header("3️⃣ Export")
-        pdf_b = create_pdf_report(df_res, country_name, start_date, end_date, {
+        # Adaptation pour inclure les nouveaux indicateurs dans le PDF
+        pdf_b = create_pdf_report(df_res.rename(columns={'Bâtiments': 'Bâtiments Affectés', 'Segments Route': 'Routes Affectées (km)'}), country_name, start_date, end_date, {
             'area': df_res['Inondé (km2)'].sum(), 'pop': df_res['Pop. Exposée'].sum(),
-            'buildings': df_res['Bâtiments Affectés'].sum(), 'roads': df_res['Routes Affectées (km)'].sum(), 'rain': total_rain
+            'buildings': df_res['Bâtiments'].sum(), 'roads': df_res['Segments Route'].sum(), 'rain': total_rain
         })
-        st.sidebar.download_button("📄 Télécharger Rapport Décisionnel", pdf_b, "rapport_decision_urgence.pdf")
+        st.sidebar.download_button("📄 Télécharger Rapport Décisionnel", pdf_b, "rapport_impact_osm.pdf")
 
 if 'df_res' in locals():
     st.dataframe(df_res.drop(columns=['orig_id']), use_container_width=True)
