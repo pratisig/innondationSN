@@ -81,7 +81,8 @@ def create_pdf_report(df, country, p1, p2, stats):
         pdf.cell(38, 8, f"{row['Inondé (km2)']:.2f}", border=1)
         pdf.cell(38, 8, f"{row['Pop. Exposée']:,}", border=1)
         pdf.cell(38, 8, f"{row['Bâtiments Affectés']:,}", border=1)
-        pdf.cell(38, 8, f"{row['Routes Affectées (km)']:.1f}", border=1, ln=True)
+        pdf.cell(38, 8, f"{row['Routes Affectées']:.1f}", border=1, ln=True)
+
         
     return pdf.output(dest='S').encode('latin-1')
 
