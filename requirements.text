@@ -1,9 +1,7 @@
 streamlit
-geopandas==0.14.3
-shapely==2.0.2
-pyproj==3.6.1
-fiona==1.9.5
 osmnx==1.9.4
+shapely==2.0.2
 folium
 streamlit-folium
 requests
+networkx
