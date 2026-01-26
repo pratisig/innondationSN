@@ -64,23 +64,24 @@ def create_pdf_report(df, country, p1, p2, stats):
     pdf.set_font("Arial", "", 12)
     pdf.cell(190, 8, f"- Surface Inondee Totale: {stats['area']:.2f} km2", ln=True)
     pdf.cell(190, 8, f"- Population Exposee: {stats['pop']:,}", ln=True)
-    pdf.cell(190, 8, f"- Pluie Moyenne: {stats.get('rain', 0):.2f} mm", ln=True)
+    pdf.cell(190, 8, f"- Batiments Touches: {stats['buildings']:,}", ln=True)
+    pdf.cell(190, 8, f"- Routes Affectees: {stats['roads']:.1f} km", ln=True)
     pdf.ln(5)
     
     pdf.set_font("Arial", "B", 14)
     pdf.cell(190, 10, "2. Detail par Zone Administrative", ln=True)
-    pdf.set_font("Arial", "B", 8)
-    cols = ["Zone", "Surf. (km2)", "% Inon", "Pop. Exp", "Pluie(mm)"]
+    pdf.set_font("Arial", "B", 7)
+    cols = ["Zone", "Surf.(km2)", "Pop.Exp", "Bat.Touch", "Routes(km)"]
     for col in cols: pdf.cell(38, 8, col, border=1)
     pdf.ln()
     
-    pdf.set_font("Arial", "", 8)
+    pdf.set_font("Arial", "", 7)
     for _, row in df.iterrows():
         pdf.cell(38, 8, str(row['Zone'])[:22], border=1)
         pdf.cell(38, 8, f"{row['Inondé (km2)']:.2f}", border=1)
-        pdf.cell(38, 8, f"{row['% Inondé']:.1f}%", border=1)
         pdf.cell(38, 8, f"{row['Pop. Exposée']:,}", border=1)
-        pdf.cell(38, 8, f"{row.get('Pluie(mm)', 0):.1f}", border=1, ln=True)
+        pdf.cell(38, 8, f"{row['Bâtiments Affectés']:,}", border=1)
+        pdf.cell(38, 8, f"{row['Routes Affectées (km)']:.1f}", border=1, ln=True)
         
     return pdf.output(dest='S').encode('latin-1')
 
@@ -90,11 +91,12 @@ def get_true_area_km2(geom_shapely):
     return area / 1e6
 
 # ------------------------------------------------------------
-# DATASETS - FAO GAUL (Stable Source for Admin 0-2)
+# DATASETS
 # ------------------------------------------------------------
-# FAO GAUL 2015 est la collection la plus complète pour l'Admin 2 (Départements/Communes)
 GAUL = ee.FeatureCollection("FAO/GAUL/2015/level2")
 GAUL_A1 = ee.FeatureCollection("FAO/GAUL/2015/level1")
+OSM_BUILDINGS = ee.FeatureCollection("projects/google/osm/buildings")
+OSM_ROADS = ee.FeatureCollection("projects/google/osm/roads")
 
 # ------------------------------------------------------------
 # SIDEBAR - CASCADE ADMINISTRATIVE
@@ -102,33 +104,25 @@ GAUL_A1 = ee.FeatureCollection("FAO/GAUL/2015/level1")
 st.sidebar.header("1️⃣ Sélection Administrative")
 country_name = st.sidebar.selectbox("Pays", ["Senegal", "Mali", "Mauritania", "Gambia", "Guinea"])
 
-# Mapping des noms de colonnes GAUL
-C0 = 'ADM0_NAME'
-C1 = 'ADM1_NAME'
-C2 = 'ADM2_NAME'
+C0, C1, C2 = 'ADM0_NAME', 'ADM1_NAME', 'ADM2_NAME'
 
 def safe_get_info(ee_obj):
-    try:
-        return ee_obj.getInfo()
+    try: return ee_obj.getInfo()
     except Exception as e:
         st.error(f"Erreur GEE : {e}")
         return None
 
-# Admin 1
 a1_fc = GAUL_A1.filter(ee.Filter.eq(C0, country_name))
 a1_list = safe_get_info(a1_fc.aggregate_array(C1).distinct().sort())
-
 sel_a1 = st.sidebar.multiselect("Régions (Admin 1)", a1_list if a1_list else [])
 
 final_aoi_fc = None
 label_col = C1
 
 if sel_a1:
-    # Admin 2
     a2_fc = GAUL.filter(ee.Filter.eq(C0, country_name)).filter(ee.Filter.inList(C1, sel_a1))
     a2_list = safe_get_info(a2_fc.aggregate_array(C2).distinct().sort())
-    
-    sel_a2 = st.sidebar.multiselect("Départements/Zones (Admin 2)", a2_list if a2_list else [])
+    sel_a2 = st.sidebar.multiselect("Zones (Admin 2)", a2_list if a2_list else [])
     
     if sel_a2:
         final_aoi_fc = a2_fc.filter(ee.Filter.inList(C2, sel_a2))
@@ -137,7 +131,7 @@ if sel_a1:
         final_aoi_fc = a1_fc.filter(ee.Filter.inList(C1, sel_a1))
         label_col = C1
 else:
-    st.info("Veuillez sélectionner au moins une région pour commencer l'analyse.")
+    st.info("Veuillez sélectionner au moins une région.")
     st.stop()
 
 with st.spinner("Chargement de la zone d'étude..."):
@@ -145,7 +139,6 @@ with st.spinner("Chargement de la zone d'étude..."):
     if not aoi_info or not aoi_info['features']:
         st.error("Aucune géométrie trouvée.")
         st.stop()
-        
     gdf = gpd.GeoDataFrame.from_features(aoi_info, crs="EPSG:4326")
     merged_poly = unary_union(gdf.geometry)
     geom_ee = ee.Geometry(mapping(merged_poly))
@@ -172,20 +165,34 @@ def get_flood_and_rain(aoi_json, start_str, end_str):
     if count is None or count < 1: return None, None
     
     ref = ee.ImageCollection("COPERNICUS/S1_GRD").filterBounds(aoi).filterDate("2024-01-01", "2024-03-31").median()
-    # On s'assure que l'image flood est binaire (1 bande)
     flood = s1.median().subtract(ref).lt(-3).select(0)
-    
     slope = ee.Terrain.slope(ee.Image("USGS/SRTMGL1_003"))
     rain = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(aoi).filterDate(start_str, end_str).sum().rename('precip')
     
-    # Correction : updateMask avec une image à 1 seule bande
     return flood.updateMask(slope.lt(5)).selfMask(), rain
 
 # ------------------------------------------------------------
-# ANIMATION & IMPACT
+# ANALYSE D'IMPACT INFRASTRUCTURE (OSM)
+# ------------------------------------------------------------
+def analyze_infrastructure_impact(flood_img, aoi_ee):
+    # Buffer de l'inondation pour l'intersection vectorielle
+    flood_vec = flood_img.reduceToVectors(geometry=aoi_ee, scale=100, eightConnected=True)
+    
+    # 1. Bâtiments
+    buildings = OSM_BUILDINGS.filterBounds(aoi_ee)
+    affected_buildings = buildings.filterBounds(flood_vec)
+    
+    # 2. Routes
+    roads = OSM_ROADS.filterBounds(aoi_ee)
+    affected_roads = roads.filterBounds(flood_vec)
+    
+    return affected_buildings, affected_roads
+
+# ------------------------------------------------------------
+# VISUALISATION & IMPACT
 # ------------------------------------------------------------
 if analysis_mode == "Série Temporelle Animée":
-    st.subheader("🎞️ Évolution Temporelle des Inondations")
+    st.subheader("🎞️ Évolution Temporelle")
     dates = pd.date_range(start=start_date, end=end_date, freq=f'{interval}D')
     ts_rows = []
     images = []
@@ -197,90 +204,82 @@ if analysis_mode == "Série Temporelle Animée":
             if f:
                 area_res = safe_get_info(f.multiply(ee.Image.pixelArea()).reduceRegion(ee.Reducer.sum(), geom_ee, 300))
                 area_val = area_res.get('VV', 0) if area_res else 0
-                ts_rows.append({"Date": d1, "Surface (km2)": (area_val/1e6) if area_val else 0})
+                ts_rows.append({"Date": d1, "Surface (km2)": (area_val/1e6)})
                 images.append(f.visualize(palette=['#00D4FF']))
 
         if images:
             col_a, col_b = st.columns([2, 1])
-            gif_url = ee.ImageCollection(images).getVideoThumbURL({
-                'dimensions': 600, 'region': geom_ee, 'framesPerSecond': 2, 'crs': 'EPSG:3857'
-            })
-            col_a.image(gif_url, use_container_width=True, caption="Eau détectée par Sentinel-1")
-            col_b.write("**Graphique de surface (km²)**")
+            gif_url = ee.ImageCollection(images).getVideoThumbURL({'dimensions': 600, 'region': geom_ee, 'framesPerSecond': 2})
+            col_a.image(gif_url, use_container_width=True)
             col_b.line_chart(pd.DataFrame(ts_rows).set_index("Date"))
 
-st.subheader("🗺️ Carte d'Impact & Statistiques")
+st.subheader("🗺️ Analyse d'Impact Spatiale & Infrastructures")
 
-with st.spinner("Analyse des impacts spatiaux..."):
+with st.spinner("Analyse approfondie (Population & OSM)..."):
     flood_all, rain_all = get_flood_and_rain(geom_ee.getInfo(), str(start_date), str(end_date))
-    # Sélectionner la première bande pour WorldPop pour éviter les masques multi-bandes
     pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").filterBounds(geom_ee).mean().select(0)
 
     if flood_all:
+        aff_buildings, aff_roads = analyze_infrastructure_impact(flood_all, geom_ee)
         rain_stats = safe_get_info(rain_all.reduceRegion(ee.Reducer.mean(), geom_ee, 2000))
         total_rain = rain_stats.get('precip', 0) if rain_stats else 0
         
         features_list = []
         for idx, row in gdf.iterrows():
             f_geom = ee.Geometry(mapping(row.geometry))
-            # On s'assure que flood_all est bien traité comme une seule bande pour le masque
+            
+            # Stats Population & Surface
             loc_stats = safe_get_info(ee.Image.cat([
                 flood_all.multiply(ee.Image.pixelArea()).rename('f_area'),
                 pop_img.updateMask(flood_all.select(0)).rename('p_exp')
             ]).reduceRegion(ee.Reducer.sum(), f_geom, 250))
             
-            t_pop_res = safe_get_info(pop_img.reduceRegion(ee.Reducer.sum(), f_geom, 250))
-            # Le nom de la bande peut varier (souvent 'population' ou 'unconstrained')
-            band_name = pop_img.bandNames().get(0).getInfo() if safe_get_info(pop_img.bandNames()) else 'population'
-            t_pop_val = t_pop_res.get(band_name, 0) if t_pop_res else 0
+            # Stats OSM (Nombre de bâtiments et longueur de routes)
+            b_count = safe_get_info(aff_buildings.filterBounds(f_geom).size())
+            # Simplification : calcul longueur approximative des routes affectées
+            r_count = safe_get_info(aff_roads.filterBounds(f_geom).aggregate_sum('length'))
+            r_km = (float(r_count) / 1000.0) if r_count else 0
             
             f_km2 = (loc_stats.get('f_area', 0) if loc_stats else 0) / 1e6
             p_exp = (loc_stats.get('p_exp', 0) if loc_stats else 0)
             
             features_list.append({
                 "Zone": row[label_col],
-                "Surf. Poly (km2)": round(get_true_area_km2(row.geometry), 2),
                 "Inondé (km2)": round(f_km2, 2),
                 "% Inondé": round((f_km2 / get_true_area_km2(row.geometry) * 100), 1) if f_km2 > 0 else 0,
-                "Pop. Totale": int(t_pop_val),
                 "Pop. Exposée": int(p_exp),
-                "Pluie(mm)": round(total_rain, 1),
+                "Bâtiments Affectés": int(b_count) if b_count else 0,
+                "Routes Affectées (km)": round(r_km, 1),
                 "orig_id": idx
             })
             
         df_res = pd.DataFrame(features_list)
 
         m = folium.Map(location=[merged_poly.centroid.y, merged_poly.centroid.x], zoom_start=9, tiles="CartoDB dark_matter")
-        # Forcer flood_all à être visualisé en une bande
         mid = flood_all.select(0).getMapId({'palette':['#00D4FF']})
         folium.TileLayer(tiles=mid['tile_fetcher'].url_format, attr='GEE', name="Zones Inondées", overlay=True).add_to(m)
 
         for _, r in df_res.iterrows():
             geom = gdf.iloc[int(r['orig_id'])].geometry
-            pop_html = f"<b>{r['Zone']}</b><br>Inondé: {r['Inondé (km2)']} km²<br>Pop Exposée: {r['Pop. Exposée']:,}"
-            folium.GeoJson(
-                geom,
-                style_function=lambda x, c=("red" if r['% Inondé']>5 else "orange"): {
-                    'fillColor': c, 'color': 'white', 'weight': 1, 'fillOpacity': 0.2
-                },
-                popup=folium.Popup(pop_html, max_width=200)
-            ).add_to(m)
+            pop_html = f"<b>{r['Zone']}</b><br>Bâtiments affectés: {r['Bâtiments Affectés']}<br>Routes: {r['Routes Affectées (km)']} km"
+            folium.GeoJson(geom, style_function=lambda x: {'fillColor': 'red', 'color': 'white', 'weight': 1, 'fillOpacity': 0.1},
+                           popup=folium.Popup(pop_html, max_width=200)).add_to(m)
 
         st_folium(m, width="100%", height=500)
 
         st.write("---")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Surface Inondée Totale", f"{df_res['Inondé (km2)'].sum():.2f} km²")
-        c2.metric("Population Exposée", f"{df_res['Pop. Exposée'].sum():,}")
-        c3.metric("Pluviométrie Cumulée", f"{total_rain:.1f} mm")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Surface Inondée", f"{df_res['Inondé (km2)'].sum():.2f} km²")
+        c2.metric("Pop. Exposée", f"{df_res['Pop. Exposée'].sum():,}")
+        c3.metric("Bâtiments Touchés", f"{df_res['Bâtiments Affectés'].sum():,}")
+        c4.metric("Routes Coupées", f"{df_res['Routes Affectées (km)'].sum():.1f} km")
 
         st.sidebar.header("3️⃣ Export")
         pdf_b = create_pdf_report(df_res, country_name, start_date, end_date, {
-            'area': df_res['Inondé (km2)'].sum(), 
-            'pop': df_res['Pop. Exposée'].sum(),
-            'rain': total_rain
+            'area': df_res['Inondé (km2)'].sum(), 'pop': df_res['Pop. Exposée'].sum(),
+            'buildings': df_res['Bâtiments Affectés'].sum(), 'roads': df_res['Routes Affectées (km)'].sum(), 'rain': total_rain
         })
-        st.sidebar.download_button("📄 Télécharger Rapport PDF", pdf_b, "rapport_impact.pdf")
+        st.sidebar.download_button("📄 Télécharger Rapport Décisionnel", pdf_b, "rapport_decision_urgence.pdf")
 
 if 'df_res' in locals():
     st.dataframe(df_res.drop(columns=['orig_id']), use_container_width=True)
