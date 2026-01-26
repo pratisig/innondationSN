@@ -8,3 +8,4 @@ streamlit-folium
 pandas
 plotly
 osmnx 
+reportlab
