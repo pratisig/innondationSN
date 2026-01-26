@@ -127,19 +127,29 @@ def detect_floods(aoi_serialized, start, end):
     # On reconstruit la géométrie car ee.Geometry n'est pas sérialisable par st.cache
     aoi = ee.Geometry(aoi_serialized)
     
+    # Formatage strict des dates pour GEE (YYYY-MM-DD)
+    # GEE n'aime pas le format Timestamp par défaut de pandas qui inclut HH:MM:SS
+    t_start = pd.to_datetime(start)
+    t_end = pd.to_datetime(end)
+    
+    d_start = t_start.strftime('%Y-%m-%d')
+    d_start_plus_15 = (t_start + pd.Timedelta(days=15)).strftime('%Y-%m-%d')
+    
+    d_end_minus_15 = (t_end - pd.Timedelta(days=15)).strftime('%Y-%m-%d')
+    d_end = t_end.strftime('%Y-%m-%d')
+    
     s1 = (
         ee.ImageCollection("COPERNICUS/S1_GRD")
         .filterBounds(aoi)
-        .filterDate(str(start), str(end))
+        .filterDate(d_start, d_end)
         .filter(ee.Filter.eq("instrumentMode", "IW"))
         .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
         .select("VV")
     )
 
     # Réduction temporelle (médiane) pour stabiliser le signal
-    # "Before" : début de période, "After" : fin de période
-    before = s1.filterDate(str(start), str(pd.to_datetime(start) + pd.Timedelta(days=15))).median()
-    after = s1.filterDate(str(pd.to_datetime(end) - pd.Timedelta(days=15)), str(end)).median()
+    before = s1.filterDate(d_start, d_start_plus_15).median()
+    after = s1.filterDate(d_end_minus_15, d_end).median()
 
     # Détection de changement (Seuil adaptatif SAR)
     diff = after.subtract(before)
