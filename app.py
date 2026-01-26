@@ -12,6 +12,7 @@ import tempfile, os, json, zipfile
 import pandas as pd
 import plotly.express as px
 from shapely.geometry import Polygon, MultiPolygon
+from pyproj import Geod
 
 # ------------------------------------------------------------
 # PAGE CONFIG
@@ -22,7 +23,7 @@ st.set_page_config(
     page_icon="🌊"
 )
 st.title("🌊 Flood Impact Analysis & Mapping")
-st.caption("Satellite-based flood detection using Sentinel-1 SAR and open datasets")
+st.caption("Satellite-based flood detection using Sentinel-1 SAR, WorldPop, and OSM data")
 
 # ------------------------------------------------------------
 # INIT GEE
@@ -40,7 +41,7 @@ def init_gee():
 init_gee()
 
 # ------------------------------------------------------------
-# SHAPELY -> EE GEOMETRY
+# UTILS
 # ------------------------------------------------------------
 def shapely_to_ee(poly):
     geojson = poly.__geo_interface__
@@ -51,13 +52,19 @@ def shapely_to_ee(poly):
     else:
         return ee.Geometry(geojson)
 
+def get_true_area_km2(geom_shapely):
+    """Calcule la surface réelle en km2 via pyproj Geod pour éviter les erreurs de projection."""
+    geod = Geod(ellps="WGS84")
+    area = abs(geod.geometry_area_perimeter(geom_shapely)[0])
+    return area / 1e6
+
 # ------------------------------------------------------------
 # FILE UPLOAD
 # ------------------------------------------------------------
 st.sidebar.header("1️⃣ Zone d’étude")
 uploaded_file = st.sidebar.file_uploader("Charger une zone (GeoJSON / SHP ZIP / KML)", type=["geojson","kml","zip"])
 if not uploaded_file:
-    st.info("Veuillez charger une zone géographique.")
+    st.info("Veuillez charger une zone géographique pour commencer l'analyse.")
     st.stop()
 
 with tempfile.TemporaryDirectory() as tmpdir:
@@ -80,7 +87,10 @@ with tempfile.TemporaryDirectory() as tmpdir:
     except Exception as e:
         st.error(f"Erreur lecture fichier : {e}"); st.stop()
 
-# Géométrie globale simplifiée pour GEE
+# Nettoyage des noms de colonnes pour trouver un label
+label_col = next((c for c in gdf.columns if c.lower() in ['name', 'nom', 'libelle', 'id_zone']), None)
+
+# Géométrie globale simplifiée
 merged_poly = gdf.geometry.unary_union.simplify(0.001, preserve_topology=True)
 geom = shapely_to_ee(merged_poly)
 st.success(f"✅ Zone chargée : {len(gdf)} entité(s)")
@@ -97,7 +107,7 @@ if start_date >= end_date: st.error("La date de fin doit être postérieure à l
 # SENTINEL-1 FLOOD DETECTION
 # ------------------------------------------------------------
 @st.cache_data
-def detect_floods(aoi_serialized,start,end):
+def detect_floods(aoi_serialized, start, end):
     aoi = ee.Geometry(aoi_serialized)
     t_start, t_end = pd.to_datetime(start), pd.to_datetime(end)
     d_start = t_start.strftime('%Y-%m-%d')
@@ -107,148 +117,157 @@ def detect_floods(aoi_serialized,start,end):
 
     s1 = (ee.ImageCollection("COPERNICUS/S1_GRD")
           .filterBounds(aoi)
-          .filterDate(d_start,d_end)
+          .filterDate(d_start, d_end)
           .filter(ee.Filter.eq("instrumentMode","IW"))
           .filter(ee.Filter.listContains("transmitterReceiverPolarisation","VV"))
           .select("VV"))
-    before = s1.filterDate(d_start,d_start_p15).median()
-    after = s1.filterDate(d_end_m15,d_end).median()
+    
+    before = s1.filterDate(d_start, d_start_p15).median()
+    after = s1.filterDate(d_end_m15, d_end).median()
+    
     diff = after.subtract(before)
     flood = diff.lt(-3)
+    
     dem = ee.Image("USGS/SRTMGL1_003")
     slope = ee.Terrain.slope(dem)
     water_perm = ee.Image("JRC/GSW1_4/GlobalSurfaceWater").select("occurrence")
-    flood = flood.updateMask(slope.lt(5)).updateMask(water_perm.lt(10))
-    return flood.selfMask()
+    
+    flood_clean = flood.updateMask(slope.lt(5)).updateMask(water_perm.lt(10))
+    return flood_clean.selfMask()
 
 with st.spinner("Analyse satellite Sentinel-1..."):
     flood_img = detect_floods(geom.getInfo(), start_date, end_date)
 
 # ------------------------------------------------------------
-# CALCUL DES INDICATEURS GLOBAUX
+# INDICATEURS PAR ZONE (ENRICHIS)
 # ------------------------------------------------------------
 pixel_area = ee.Image.pixelArea()
-pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").filterDate("2020-01-01","2020-12-31").mean()
+pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").filterDate("2020-01-01","2020-12-31").mean().select('population')
 
-total_flood_area = ee.Number(flood_img.multiply(pixel_area).reduceRegion(ee.Reducer.sum(),geom,100,maxPixels=1e13).get("VV")).divide(1e6).getInfo()
-total_pop_exposed = int(ee.Number(pop_img.updateMask(flood_img).reduceRegion(ee.Reducer.sum(),geom,100,maxPixels=1e13).get("population")).getInfo())
-total_rain = float(ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(geom).filterDate(str(start_date),str(end_date)).sum().reduceRegion(ee.Reducer.mean(),geom,5000,maxPixels=1e13).get("precipitation").getInfo())
+# Dataset OSM (Infrastructures) via MS Global ML buildings ou OSM High-res
+# On utilise ici un proxy OSM via un FeatureCollection si dispo, ou extraction de points
+infra_osm = ee.FeatureCollection("GOOGLE/Research/open-buildings/v3/polygons").filterBounds(geom)
 
-st.subheader("📊 Indicateurs globaux")
-c1,c2,c3 = st.columns(3)
-c1.metric("Surface inondée", f"{total_flood_area:.2f} km²")
-c2.metric("Population exposée", f"{total_pop_exposed:,}")
-c3.metric("Pluie cumulée", f"{total_rain:.1f} mm")
-
-# ------------------------------------------------------------
-# CALCUL DES INDICATEURS PAR ZONE
-# ------------------------------------------------------------
 zone_metrics = []
-for idx,row in gdf.iterrows():
-    poly = row.geometry
-    ee_poly = shapely_to_ee(poly)
-    try:
-        flood_km2 = ee.Number(flood_img.multiply(pixel_area).reduceRegion(ee.Reducer.sum(),ee_poly,100,1e13).get("VV")).divide(1e6).getInfo()
-        pop_exposed = int(ee.Number(pop_img.updateMask(flood_img).reduceRegion(ee.Reducer.sum(),ee_poly,100,1e13).get("population")).getInfo())
-        rain_total = float(ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(ee_poly).filterDate(str(start_date),str(end_date)).sum().reduceRegion(ee.Reducer.mean(),ee_poly,5000,1e13).get("precipitation").getInfo())
-    except: flood_km2=0; pop_exposed=0; rain_total=0
-    pct_flood = flood_km2/(poly.area/1e6) if poly.area>0 else 0
-    zone_metrics.append({"zone":idx+1,"surface_km2":poly.area/1e6,"flood_km2":flood_km2,
-                         "pct_flood":pct_flood*100,"pop_exposed":pop_exposed,"rain_mm":rain_total})
+with st.spinner("Calcul des impacts par zone..."):
+    for idx, row in gdf.iterrows():
+        poly = row.geometry
+        ee_poly = shapely_to_ee(poly)
+        name_zone = row[label_col] if label_col else f"Zone {idx+1}"
+        
+        # Surface totale réelle
+        total_area_km2 = get_true_area_km2(poly)
+        
+        try:
+            # Stats GEE
+            stats = ee.Dictionary({
+                'flood_m2': flood_img.multiply(pixel_area).reduceRegion(ee.Reducer.sum(), ee_poly, 100).get("VV"),
+                'pop_total': pop_img.reduceRegion(ee.Reducer.sum(), ee_poly, 100).get("population"),
+                'pop_exposed': pop_img.updateMask(flood_img).reduceRegion(ee.Reducer.sum(), ee_poly, 100).get("population"),
+                'infra_exposed': infra_osm.filterBounds(ee_poly).filter(ee.Filter.intersects(".geo", ee.Feature(ee_poly).geometry())).size()
+            }).getInfo()
+            
+            flood_km2 = (stats.get('flood_m2') or 0) / 1e6
+            pop_total = int(stats.get('pop_total') or 0)
+            pop_exposed = int(stats.get('pop_exposed') or 0)
+            infra_count = int(stats.get('infra_exposed') or 0)
+            
+        except Exception as e:
+            flood_km2, pop_total, pop_exposed, infra_count = 0, 0, 0, 0
+            
+        pct_flood = (flood_km2 / total_area_km2 * 100) if total_area_km2 > 0 else 0
+        pct_pop = (pop_exposed / pop_total * 100) if pop_total > 0 else 0
+        
+        zone_metrics.append({
+            "id": idx,
+            "nom": name_zone,
+            "surface_totale_km2": total_area_km2,
+            "surface_inondee_km2": flood_km2,
+            "pct_inonde": pct_flood,
+            "pop_totale": pop_total,
+            "pop_exposee": pop_exposed,
+            "pct_pop_exposee": pct_pop,
+            "infra_impactees": infra_count
+        })
 
 df_metrics = pd.DataFrame(zone_metrics)
 
 # ------------------------------------------------------------
-# CARTE INTERACTIVE AVEC DEGRADÉ
+# INDICATEURS GLOBAUX
 # ------------------------------------------------------------
-st.subheader("🗺️ Carte interactive des zones inondées")
+st.subheader("📊 Synthèse de l'impact")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Surface Inondée", f"{df_metrics.surface_inondee_km2.sum():.2f} km²")
+c2.metric("Population Exposée", f"{df_metrics.pop_exposee.sum():,}")
+c3.metric("Bâtiments impactés", f"{df_metrics.infra_impactees.sum():,}")
+c4.metric("Zone la plus touchée", f"{df_metrics.loc[df_metrics.pct_inonde.idxmax(), 'nom']}" if not df_metrics.empty else "-")
+
+# ------------------------------------------------------------
+# CARTE INTERACTIVE
+# ------------------------------------------------------------
+st.subheader("🗺️ Cartographie des risques")
 bounds = gdf.total_bounds
-m = folium.Map(location=[(bounds[1]+bounds[3])/2,(bounds[0]+bounds[2])/2],zoom_start=10,tiles="CartoDB positron")
+m = folium.Map(location=[(bounds[1]+bounds[3])/2, (bounds[0]+bounds[2])/2], zoom_start=10, tiles="CartoDB positron")
 
 def get_color(pct):
-    if pct<10: return "#2ECC71"
-    elif pct<30: return "#F1C40F"
-    elif pct<60: return "#E67E22"
+    if pct < 5: return "#2ECC71"
+    elif pct < 15: return "#F1C40F"
+    elif pct < 40: return "#E67E22"
     else: return "#E74C3C"
 
-for idx,row in gdf.iterrows():
-    poly = row.geometry
-    metrics = df_metrics.iloc[idx]
+for idx, row in gdf.iterrows():
+    m_row = df_metrics[df_metrics.id == idx].iloc[0]
+    
     popup_html = f"""
-    <b>Zone {metrics.zone}</b><br>
-    Surface totale: {metrics.surface_km2:.2f} km²<br>
-    Surface inondée: {metrics.flood_km2:.2f} km²<br>
-    % inondée: {metrics.pct_flood:.1f}%<br>
-    Population exposée: {metrics.pop_exposed:,}<br>
-    Pluie cumulée: {metrics.rain_mm:.1f} mm
+    <div style="font-family: Arial; width: 200px;">
+        <h4 style="margin-bottom:5px;">{m_row.nom}</h4>
+        <hr style="margin:5px 0;">
+        <b>Surface Totale:</b> {m_row.surface_totale_km2:.2f} km²<br>
+        <b>Inondée:</b> {m_row.surface_inondee_km2:.2f} km² ({m_row.pct_inonde:.1f}%)<br>
+        <br>
+        <b>Pop. Totale:</b> {m_row.pop_totale:,}<br>
+        <b>Pop. Exposée:</b> {m_row.pop_exposee:,} ({m_row.pct_pop_exposee:.1f}%)<br>
+        <br>
+        <b>Bâtiments impactés:</b> {m_row.infra_impactees:,}
+    </div>
     """
+    
     folium.GeoJson(
-        poly,
-        style_function=lambda feature,pct=metrics.pct_flood: {"fillColor":get_color(pct),
-                                                              "color":"#555555","weight":2,"fillOpacity":0.6},
-        tooltip=folium.Tooltip(f"Zone {metrics.zone} – {metrics.pct_flood:.1f}% inondée"),
-        popup=folium.Popup(popup_html,max_width=300)
+        row.geometry,
+        style_function=lambda x, p=m_row.pct_inonde: {
+            "fillColor": get_color(p),
+            "color": "#333", "weight": 1.5, "fillOpacity": 0.5
+        },
+        popup=folium.Popup(popup_html, max_width=250),
+        tooltip=f"{m_row.nom}: {m_row.pct_inonde:.1f}% inondé"
     ).add_to(m)
 
-# Overlay Sentinel-1
+# Overlay Sentinel-1 (Bleu vif)
 try:
-    flood_mapid = flood_img.getMapId({'min':0,'max':1,'palette':['#0000FF']})
-    folium.TileLayer(tiles=flood_mapid['tile_fetcher'].url_format,
-                     attr='GEE - Sentinel-1',name='Zones Inondées',overlay=True,control=True,opacity=0.4).add_to(m)
+    flood_mapid = flood_img.getMapId({'min': 0, 'max': 1, 'palette': ['#00FFFF']})
+    folium.TileLayer(
+        tiles=flood_mapid['tile_fetcher'].url_format,
+        attr='GEE Sentinel-1', name='Détection Satellite (Eau)',
+        overlay=True, opacity=0.8
+    ).add_to(m)
 except: pass
 
-# Légende
-legend_html="""
-<div style="position: fixed; bottom:50px; left:50px; width:220px; height:160px; background:white; z-index:9999; font-size:14px; border:2px solid grey; padding:5px;">
-<b>Légende % inondation</b><br>
-<i style="background:#2ECC71;width:15px;height:15px;float:left;margin-right:5px;"></i> <10%<br>
-<i style="background:#F1C40F;width:15px;height:15px;float:left;margin-right:5px;"></i> 10-30%<br>
-<i style="background:#E67E22;width:15px;height:15px;float:left;margin-right:5px;"></i> 30-60%<br>
-<i style="background:#E74C3C;width:15px;height:15px;float:left;margin-right:5px;"></i> >60%<br>
-<i style="background:blue;width:15px;height:15px;float:left;margin-right:5px;"></i> Sentinel-1
-</div>
-"""
-m.get_root().html.add_child(folium.Element(legend_html))
 folium.LayerControl().add_to(m)
-st_folium(m,width="100%",height=600)
+st_folium(m, width="100%", height=600)
 
 # ------------------------------------------------------------
-# SERIE TEMPORELLE
+# TABLEAU ET EXPORT
 # ------------------------------------------------------------
-st.subheader("📈 Dynamique des précipitations quotidiennes (CHIRPS)")
+st.subheader("📋 Rapport détaillé par zone")
+st.dataframe(df_metrics.drop(columns=['id']).style.format({
+    "surface_totale_km2": "{:.2f}",
+    "surface_inondee_km2": "{:.2f}",
+    "pct_inonde": "{:.1f}%",
+    "pop_totale": "{:,}",
+    "pop_exposee": "{:,}",
+    "pct_pop_exposee": "{:.1f}%",
+    "infra_impactees": "{:,}"
+}), use_container_width=True)
 
-@st.cache_data
-def get_rain_series(aoi_serialized,start,end):
-    try:
-        aoi = ee.Geometry(aoi_serialized)
-        chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(aoi).filterDate(str(start),str(end))
-        def extract_val(img):
-            val = img.reduceRegion(ee.Reducer.mean(),geometry=aoi,scale=5000).get('precipitation')
-            return ee.Feature(None,{'date':img.date().format('YYYY-MM-dd'),'rain':val})
-        fc = chirps.map(extract_val).getInfo()
-        return pd.DataFrame([f['properties'] for f in fc['features']])
-    except: return pd.DataFrame()
-
-with st.spinner("Calcul des précipitations journalières..."):
-    df_rain = get_rain_series(geom.getInfo(),start_date,end_date)
-    if not df_rain.empty:
-        df_rain['date']=pd.to_datetime(df_rain['date'])
-        fig = px.bar(df_rain,x='date',y='rain',title="Précipitations quotidiennes (mm)",color_discrete_sequence=['#00aaff'])
-        st.plotly_chart(fig,use_container_width=True)
-
-# ------------------------------------------------------------
-# TABLEAU RECAPITULATIF
-# ------------------------------------------------------------
-st.subheader("📋 Tableau récapitulatif par zone")
-
-# Filtres interactifs
-min_pct = st.slider("Filtrer par % inondée minimum",0,100,0)
-max_pct = st.slider("Filtrer par % inondée maximum",0,100,100)
-df_filtered = df_metrics[(df_metrics.pct_flood>=min_pct)&(df_metrics.pct_flood<=max_pct)]
-
-st.dataframe(df_filtered.style.format({"surface_km2":"{:.2f}","flood_km2":"{:.2f}",
-                                       "pct_flood":"{:.1f}%","rain_mm":"{:.1f}","pop_exposed":"{:,}"}))
-
-# Export CSV
-csv = df_filtered.to_csv(index=False).encode('utf-8')
-st.download_button("⬇️ Télécharger le tableau CSV", data=csv, file_name="zone_metrics_filtered.csv", mime="text/csv")
+csv = df_metrics.to_csv(index=False).encode('utf-8')
+st.download_button("⬇️ Télécharger le rapport complet (CSV)", data=csv, file_name="rapport_inondation.csv", mime="text/csv")
