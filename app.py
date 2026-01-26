@@ -172,10 +172,13 @@ def get_flood_and_rain(aoi_json, start_str, end_str):
     if count is None or count < 1: return None, None
     
     ref = ee.ImageCollection("COPERNICUS/S1_GRD").filterBounds(aoi).filterDate("2024-01-01", "2024-03-31").median()
-    flood = s1.median().subtract(ref).lt(-3)
+    # On s'assure que l'image flood est binaire (1 bande)
+    flood = s1.median().subtract(ref).lt(-3).select(0)
+    
     slope = ee.Terrain.slope(ee.Image("USGS/SRTMGL1_003"))
     rain = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(aoi).filterDate(start_str, end_str).sum().rename('precip')
     
+    # Correction : updateMask avec une image à 1 seule bande
     return flood.updateMask(slope.lt(5)).selfMask(), rain
 
 # ------------------------------------------------------------
@@ -210,7 +213,8 @@ st.subheader("🗺️ Carte d'Impact & Statistiques")
 
 with st.spinner("Analyse des impacts spatiaux..."):
     flood_all, rain_all = get_flood_and_rain(geom_ee.getInfo(), str(start_date), str(end_date))
-    pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").filterBounds(geom_ee).mean()
+    # Sélectionner la première bande pour WorldPop pour éviter les masques multi-bandes
+    pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").filterBounds(geom_ee).mean().select(0)
 
     if flood_all:
         rain_stats = safe_get_info(rain_all.reduceRegion(ee.Reducer.mean(), geom_ee, 2000))
@@ -219,13 +223,16 @@ with st.spinner("Analyse des impacts spatiaux..."):
         features_list = []
         for idx, row in gdf.iterrows():
             f_geom = ee.Geometry(mapping(row.geometry))
+            # On s'assure que flood_all est bien traité comme une seule bande pour le masque
             loc_stats = safe_get_info(ee.Image.cat([
                 flood_all.multiply(ee.Image.pixelArea()).rename('f_area'),
-                pop_img.updateMask(flood_all).rename('p_exp')
+                pop_img.updateMask(flood_all.select(0)).rename('p_exp')
             ]).reduceRegion(ee.Reducer.sum(), f_geom, 250))
             
             t_pop_res = safe_get_info(pop_img.reduceRegion(ee.Reducer.sum(), f_geom, 250))
-            t_pop_val = t_pop_res.get('population', 0) if t_pop_res else 0
+            # Le nom de la bande peut varier (souvent 'population' ou 'unconstrained')
+            band_name = pop_img.bandNames().get(0).getInfo() if safe_get_info(pop_img.bandNames()) else 'population'
+            t_pop_val = t_pop_res.get(band_name, 0) if t_pop_res else 0
             
             f_km2 = (loc_stats.get('f_area', 0) if loc_stats else 0) / 1e6
             p_exp = (loc_stats.get('p_exp', 0) if loc_stats else 0)
@@ -244,7 +251,8 @@ with st.spinner("Analyse des impacts spatiaux..."):
         df_res = pd.DataFrame(features_list)
 
         m = folium.Map(location=[merged_poly.centroid.y, merged_poly.centroid.x], zoom_start=9, tiles="CartoDB dark_matter")
-        mid = flood_all.getMapId({'palette':['#00D4FF']})
+        # Forcer flood_all à être visualisé en une bande
+        mid = flood_all.select(0).getMapId({'palette':['#00D4FF']})
         folium.TileLayer(tiles=mid['tile_fetcher'].url_format, attr='GEE', name="Zones Inondées", overlay=True).add_to(m)
 
         for _, r in df_res.iterrows():
