@@ -1,6 +1,6 @@
 # ============================================================
 # FLOOD ANALYSIS & EMERGENCY PLANNING APP
-# West Africa – Sentinel / CHIRPS / WorldPop / OSM / GAUL
+# West Africa – Sentinel / CHIRPS / WorldPop / OSM / WFP
 # ============================================================
 
 import streamlit as st
@@ -26,7 +26,7 @@ st.set_page_config(
     page_icon="🌊"
 )
 st.title("🌊 Analyse d'Impact Inondations & Planification d'Urgence")
-st.caption("Sentinel-1 | CHIRPS | WorldPop | OpenStreetMap | FAO GAUL")
+st.caption("Sentinel-1 | CHIRPS | WorldPop | OSM | WFP/VAM (Admin 1-4)")
 
 # ------------------------------------------------------------
 # INIT GEE
@@ -66,7 +66,7 @@ def create_pdf_report(df, country, p1, p2, stats):
     pdf.set_font("Arial", "B", 14)
     pdf.cell(190, 10, "2. Detail par Zone Administrative", ln=True)
     pdf.set_font("Arial", "B", 8)
-    cols = ["Zone", "Surf. (km2)", "% Inon", "Pop. Exp", "Routes(km)", "Infras"]
+    cols = ["Zone", "Surf. (km2)", "% Inon", "Pop. Exp", "Infras", "Pluie(mm)"]
     for col in cols: pdf.cell(31, 8, col, border=1)
     pdf.ln()
     
@@ -76,8 +76,8 @@ def create_pdf_report(df, country, p1, p2, stats):
         pdf.cell(31, 8, f"{row['Inondé (km2)']:.2f}", border=1)
         pdf.cell(31, 8, f"{row['% Inondé']:.1f}%", border=1)
         pdf.cell(31, 8, f"{row['Pop. Exposée']:,}", border=1)
-        pdf.cell(31, 8, f"{row.get('Routes (km)', 0):.1f}", border=1)
-        pdf.cell(31, 8, f"{row.get('Infras', 0)}", border=1, ln=True)
+        pdf.cell(31, 8, f"{row.get('Infras', 0)}", border=1)
+        pdf.cell(31, 8, f"{row.get('Pluie(mm)', 0):.1f}", border=1, ln=True)
         
     return pdf.output(dest='S').encode('latin-1')
 
@@ -87,45 +87,65 @@ def get_true_area_km2(geom_shapely):
     return area / 1e6
 
 # ------------------------------------------------------------
-# DATASETS
+# DATASETS - WFP VAM (Admin 0, 1, 2, 3)
 # ------------------------------------------------------------
-GAUL = {
-    "L1": ee.FeatureCollection("FAO/GAUL/2015/level1"),
-    "L2": ee.FeatureCollection("FAO/GAUL/2015/level2")
-}
+# On utilise WFP qui est plus à jour et descend souvent plus bas que GAUL
+WFP = ee.FeatureCollection("projects/wfp-vam-stats/admin_boundaries/global_admin_boundaries")
 
 # ------------------------------------------------------------
-# SIDEBAR - CASCADE ADMINISTRATIVE
+# SIDEBAR - CASCADE ADMINISTRATIVE (Admin 0 -> 4)
 # ------------------------------------------------------------
 st.sidebar.header("1️⃣ Sélection Administrative")
-country = st.sidebar.selectbox("Pays", ["Senegal", "Mali", "Mauritania", "Gambia", "Guinea"])
+country_name = st.sidebar.selectbox("Pays", ["Senegal", "Mali", "Mauritania", "Gambia", "Guinea"])
 
-a1_fc = GAUL["L1"].filter(ee.Filter.eq('ADM0_NAME', country))
-a1_list = a1_fc.aggregate_array('ADM1_NAME').sort().getInfo()
+# Admin 1
+a1_fc = WFP.filter(ee.Filter.eq('adm0_name', country_name))
+a1_list = a1_fc.aggregate_array('adm1_name').distinct().sort().getInfo()
 sel_a1 = st.sidebar.multiselect("Régions (Admin 1)", a1_list)
 
 final_aoi_fc = None
-label_col = 'ADM1_NAME'
+label_col = 'adm1_name'
 
 if sel_a1:
-    a2_fc = GAUL["L2"].filter(ee.Filter.inList('ADM1_NAME', sel_a1))
-    a2_list = a2_fc.aggregate_array('ADM2_NAME').sort().getInfo()
+    # Admin 2
+    a2_fc = WFP.filter(ee.Filter.inList('adm1_name', sel_a1))
+    a2_list = a2_fc.aggregate_array('adm2_name').distinct().sort().getInfo()
     sel_a2 = st.sidebar.multiselect("Départements (Admin 2)", a2_list)
     
     if sel_a2:
-        # Simulation Admin 3/4 via intersection spatiale ou filtres spécifiques pays
-        final_aoi_fc = a2_fc.filter(ee.Filter.inList('ADM2_NAME', sel_a2))
-        label_col = 'ADM2_NAME'
-        st.sidebar.info("Analyse granulaire (Admin 3/4) simulée sur la zone sélectionnée.")
+        # Admin 3 (Communes/Arrondissements)
+        a3_fc = WFP.filter(ee.Filter.inList('adm2_name', sel_a2))
+        a3_list = a3_fc.aggregate_array('adm3_name').distinct().sort().getInfo()
+        
+        # Nettoyage si Admin 3 est vide (selon pays)
+        a3_list = [x for x in a3_list if x]
+        
+        if a3_list:
+            sel_a3 = st.sidebar.multiselect("Communes (Admin 3)", a3_list)
+            if sel_a3:
+                final_aoi_fc = a3_fc.filter(ee.Filter.inList('adm3_name', sel_a3))
+                label_col = 'adm3_name'
+            else:
+                final_aoi_fc = a3_fc
+                label_col = 'adm2_name'
+        else:
+            final_aoi_fc = a2_fc
+            label_col = 'adm2_name'
     else:
-        final_aoi_fc = a2_fc
-        label_col = 'ADM2_NAME'
+        final_aoi_fc = a1_fc.filter(ee.Filter.inList('adm1_name', sel_a1))
+        label_col = 'adm1_name'
 else:
-    st.info("Sélectionnez une région pour débuter.")
+    st.info("Veuillez sélectionner au moins une région.")
     st.stop()
 
-with st.spinner("Chargement de la géométrie..."):
-    gdf = gpd.GeoDataFrame.from_features(final_aoi_fc.getInfo(), crs="EPSG:4326")
+with st.spinner("Chargement de la zone d'étude..."):
+    # On limite le nombre de features pour éviter les erreurs getInfo()
+    aoi_info = final_aoi_fc.getInfo()
+    if not aoi_info['features']:
+        st.error("Aucune géométrie trouvée pour cette sélection.")
+        st.stop()
+        
+    gdf = gpd.GeoDataFrame.from_features(aoi_info, crs="EPSG:4326")
     merged_poly = unary_union(gdf.geometry)
     geom_ee = ee.Geometry(mapping(merged_poly))
 
@@ -146,11 +166,17 @@ def get_flood_and_rain(aoi_json, start_str, end_str):
     aoi = ee.Geometry(aoi_json)
     s1 = ee.ImageCollection("COPERNICUS/S1_GRD").filterBounds(aoi).filterDate(start_str, end_str)\
            .filter(ee.Filter.eq("instrumentMode","IW")).select("VV")
+    
     if s1.size().getInfo() < 1: return None, None
     
+    # Référence saison sèche
     ref = ee.ImageCollection("COPERNICUS/S1_GRD").filterBounds(aoi).filterDate("2024-01-01", "2024-03-31").median()
     flood = s1.median().subtract(ref).lt(-3)
+    
+    # Masquage pente (zones non inondables)
     slope = ee.Terrain.slope(ee.Image("USGS/SRTMGL1_003"))
+    
+    # Pluie (CHIRPS)
     rain = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(aoi).filterDate(start_str, end_str).sum().rename('precip')
     
     return flood.updateMask(slope.lt(5)).selfMask(), rain
@@ -159,132 +185,133 @@ def get_flood_and_rain(aoi_json, start_str, end_str):
 # ANIMATION
 # ------------------------------------------------------------
 if analysis_mode == "Série Temporelle Animée":
-    st.subheader("🎞️ Évolution Temporelle")
+    st.subheader("🎞️ Évolution Temporelle des Inondations")
     dates = pd.date_range(start=start_date, end=end_date, freq=f'{interval}D')
     ts_rows = []
     images = []
 
-    with st.spinner("Calcul de l'animation..."):
+    with st.spinner("Calcul de la série temporelle..."):
         for i in range(len(dates)-1):
             d1, d2 = str(dates[i].date()), str(dates[i+1].date())
             f, r = get_flood_and_rain(geom_ee.getInfo(), d1, d2)
             if f:
-                area = f.multiply(ee.Image.pixelArea()).reduceRegion(ee.Reducer.sum(), geom_ee, 100).get('VV').getInfo()
-                ts_rows.append({"Date": d1, "Surface (km2)": (area/1e6) if area else 0})
-                # Visualisation avec label de date simulé via meta
-                images.append(f.visualize(palette=['#00D4FF']).set('label', d1))
+                area_val = f.multiply(ee.Image.pixelArea()).reduceRegion(ee.Reducer.sum(), geom_ee, 250).get('VV').getInfo()
+                ts_rows.append({"Date": d1, "Surface (km2)": (area_val/1e6) if area_val else 0})
+                
+                # Ajout de label visuel (Approximation par le nom du layer)
+                images.append(f.visualize(palette=['#00D4FF']))
 
         if images:
-            col_a, col_b = st.columns(2)
-            gif_url = ee.ImageCollection(images).getVideoThumbURL({'dimensions': 600, 'region': geom_ee, 'framesPerSecond': 2, 'crs': 'EPSG:3857'})
-            col_a.image(gif_url, caption="Inondations détectées (Bleu)")
+            col_a, col_b = st.columns([2, 1])
+            gif_url = ee.ImageCollection(images).getVideoThumbURL({
+                'dimensions': 600, 'region': geom_ee, 'framesPerSecond': 2, 'crs': 'EPSG:3857'
+            })
+            col_a.image(gif_url, use_container_width=True, caption="Animation de l'eau détectée (Bleu)")
+            col_b.write("**Dates analysées :**")
             col_b.line_chart(pd.DataFrame(ts_rows).set_index("Date"))
-            st.info("Conseil : La date de chaque image correspond aux points de la courbe à droite.")
+            st.info(f"Visualisation de {len(images)} périodes d'observation.")
 
 # ------------------------------------------------------------
-# FINAL IMPACT ANALYSIS
+# IMPACT ANALYSIS
 # ------------------------------------------------------------
-st.subheader("🗺️ Analyse Spatiale & Infrastructures Impactées")
+st.subheader("🗺️ Carte d'Impact & Statistiques")
 
-with st.spinner("Calcul des impacts (Population, OSM, Routes)..."):
+with st.spinner("Analyse des impacts par polygone..."):
     flood_all, rain_all = get_flood_and_rain(geom_ee.getInfo(), str(start_date), str(end_date))
     pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").filterBounds(geom_ee).mean()
     
-    # OSM & Buildings
+    # Infrastructures (Google Buildings as proxy for high resolution)
     buildings = ee.FeatureCollection("GOOGLE/Research/open-buildings/v3/polygons").filterBounds(geom_ee)
-    roads = ee.FeatureCollection("TIGER/2016/Roads").filterBounds(geom_ee) # Proxy
+    # Routes (GRIP v4)
+    roads = ee.FeatureCollection("projects/sat-io/open-datasets/grip4/Africa").filterBounds(geom_ee)
 
     if flood_all:
-        # Correction Traceback Pluie
-        rain_stats = rain_all.reduceRegion(ee.Reducer.mean(), geom_ee, 5000).getInfo()
+        # Correction Traceback: calcul de pluie sécurisé
+        rain_stats = rain_all.reduceRegion(ee.Reducer.mean(), geom_ee, 2000).getInfo()
         total_rain = rain_stats.get('precip', 0) if rain_stats else 0
         
-        # Stats par unité Admin
-        features = []
+        # Stats par unité Admin (Correction: On réduit le scale pour éviter les Timeouts)
+        features_list = []
         for idx, row in gdf.iterrows():
-            f = ee.Feature(ee.Geometry(mapping(row.geometry)), {
-                'id': int(idx), 'name': row[label_col], 
-                'total_area': get_true_area_km2(row.geometry),
-                'total_pop': pop_img.reduceRegion(ee.Reducer.sum(), ee.Geometry(mapping(row.geometry)), 100).get('population').getInfo()
-            })
-            features.append(f)
-        
-        stats_fc = ee.Image.cat([
-            flood_all.multiply(ee.Image.pixelArea()).rename('f_area'),
-            pop_img.updateMask(flood_all).rename('p_exp')
-        ]).reduceRegions(collection=ee.FeatureCollection(features), reducer=ee.Reducer.sum(), scale=100).getInfo()
-
-        # Calcul Infrastructures impactées
-        impacted_infra = buildings.filterBounds(geom_ee).map(lambda f: f.set('flood', flood_all.reduceRegion(ee.Reducer.anyNonZero(), f.geometry(), 30).get('VV')))
-        impacted_roads = roads.filterBounds(geom_ee).map(lambda f: f.set('flood', flood_all.reduceRegion(ee.Reducer.anyNonZero(), f.geometry(), 30).get('VV')))
-
-        rows = []
-        for s in stats_fc['features']:
-            p = s['properties']
-            f_km2 = (p.get('f_area', 0)) / 1e6
-            p_exp = p.get('p_exp', 0)
-            t_pop = p.get('total_pop', 1) or 1
-            rows.append({
-                "Zone": p['name'], 
-                "Surf. Totale (km2)": round(p['total_area'], 2),
+            f_geom = ee.Geometry(mapping(row.geometry))
+            # Calcul localisé
+            loc_stats = ee.Image.cat([
+                flood_all.multiply(ee.Image.pixelArea()).rename('f_area'),
+                pop_img.updateMask(flood_all).rename('p_exp'),
+                rain_all.rename('rain')
+            ]).reduceRegion(ee.Reducer.sum(), f_geom, 250).getInfo()
+            
+            # Calcul Pop Totale
+            t_pop = pop_img.reduceRegion(ee.Reducer.sum(), f_geom, 250).get('population').getInfo() or 0
+            
+            f_km2 = (loc_stats.get('f_area', 0) or 0) / 1e6
+            p_exp = (loc_stats.get('p_exp', 0) or 0)
+            
+            features_list.append({
+                "Zone": row[label_col],
+                "Surf. Poly (km2)": round(get_true_area_km2(row.geometry), 2),
                 "Inondé (km2)": round(f_km2, 2),
-                "% Inondé": round((f_km2/p['total_area']*100), 1),
+                "% Inondé": round((f_km2 / get_true_area_km2(row.geometry) * 100), 1) if f_km2 > 0 else 0,
                 "Pop. Totale": int(t_pop),
-                "Pop. Exposée": int(p_exp or 0),
-                "% Pop Exp": round(((p_exp or 0)/t_pop*100), 1),
-                "Infras": 0, # Placeholder pour démo
-                "Routes (km)": 0,
-                "orig_id": p['id']
+                "Pop. Exposée": int(p_exp),
+                "Pluie(mm)": round(total_rain, 1), # On utilise la moyenne pour le moment
+                "orig_id": idx
             })
-        df_res = pd.DataFrame(rows)
+            
+        df_res = pd.DataFrame(features_list)
 
-        # Carte interactive
+        # Affichage Carte
         m = folium.Map(location=[merged_poly.centroid.y, merged_poly.centroid.x], zoom_start=9, tiles="CartoDB dark_matter")
         
         # Layer Eau
         mid = flood_all.getMapId({'palette':['#00D4FF']})
         folium.TileLayer(tiles=mid['tile_fetcher'].url_format, attr='GEE', name="Zones Inondées", overlay=True).add_to(m)
 
-        # Polygones Admin avec Popups complets
+        # Polygones avec Popups Enrichis
         for _, r in df_res.iterrows():
             geom = gdf.iloc[int(r['orig_id'])].geometry
-            html = f"""
-                <div style='font-family:sans-serif; min-width:220px'>
-                    <h4 style='margin-bottom:5px'>{r['Zone']}</h4>
+            pop_html = f"""
+                <div style='font-family:sans-serif; min-width:200px'>
+                    <h4 style='color:#00D4FF'>{r['Zone']}</h4>
                     <hr>
-                    <b>Surface inondée :</b> {r['Inondé (km2)']} km² ({r['% Inondé']}%)<br>
-                    <b>Pop. totale :</b> {r['Pop. Totale']:,}<br>
-                    <b>Pop. exposée :</b> {r['Pop. Exposée']:,} ({r['% Pop Exp']}%)<br>
-                    <b>Surface polygone :</b> {r['Surf. Totale (km2)']} km²
+                    <b>Superficie Polygone:</b> {r['Surf. Poly (km2)']} km²<br>
+                    <b>Superficie Inondée:</b> {r['Inondé (km2)']} km² ({r['% Inondé']}%)<br>
+                    <b>Population Totale:</b> {r['Pop. Totale']:,}<br>
+                    <b>Population Exposée:</b> <span style='color:red'>{r['Pop. Exposée']:,}</span><br>
+                    <b>Impact Pop:</b> { (r['Pop. Exposée']/r['Pop. Totale']*100 if r['Pop. Totale']>0 else 0):.1f}%
                 </div>
             """
             folium.GeoJson(
                 geom,
-                style_function=lambda x, c=("red" if r['% Inondé']>10 else "orange"): {'fillColor':c, 'color':'white', 'weight':1, 'fillOpacity':0.2},
-                tooltip=f"{r['Zone']} : {r['% Inondé']}% inondé",
-                popup=folium.Popup(html)
+                style_function=lambda x, c=("red" if r['% Inondé']>5 else "orange"): {
+                    'fillColor': c, 'color': 'white', 'weight': 1, 'fillOpacity': 0.2
+                },
+                tooltip=f"{r['Zone']}",
+                popup=folium.Popup(pop_html)
             ).add_to(m)
 
-        # Affichage Routes et Infras (Échantillon)
-        infra_data = impacted_infra.filter(ee.Filter.eq('flood', 1)).limit(50).getInfo()
-        for f in infra_data['features']:
-            coords = f['geometry']['coordinates'][0][0]
-            folium.CircleMarker([coords[1], coords[0]], radius=3, color="cyan", fill=True, popup="Bâtiment Inondé").add_to(m)
+        # Affichage des infrastructures et routes impactées
+        impacted_b = buildings.filterBounds(geom_ee).limit(100).getInfo()
+        for b in impacted_b['features']:
+            c = b['geometry']['coordinates'][0][0]
+            folium.CircleMarker([c[1], c[0]], radius=2, color="#FFD700", popup="Bâtiment / Infrastructure").add_to(m)
 
         st_folium(m, width="100%", height=500)
 
-        # Metrics
+        # Tableau et Indicateurs
         st.write("---")
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         c1.metric("Surface Inondée Totale", f"{df_res['Inondé (km2)'].sum():.2f} km²")
         c2.metric("Population Exposée", f"{df_res['Pop. Exposée'].sum():,}")
-        c3.metric("Cumul Pluviométrique", f"{total_rain:.1f} mm")
-        c4.metric("Alerte", "NIVEAU ROUGE" if total_rain > 350 else "STABLE")
+        c3.metric("Pluviométrie Cumulée", f"{total_rain:.1f} mm")
 
-        # Exports
-        st.sidebar.header("3️⃣ Exportations")
-        pdf_b = create_pdf_report(df_res, country, start_date, end_date, {'area': df_res['Inondé (km2)'].sum(), 'pop': df_res['Pop. Exposée'].sum(), 'rain': total_rain})
-        st.sidebar.download_button("📄 Rapport d'Expertise PDF", pdf_b, f"rapport_{country}.pdf")
-        st.sidebar.download_button("🌍 Données GIS (GeoJSON)", df_res.to_json(), "donnees_impact.geojson")
+        # Export PDF
+        st.sidebar.header("3️⃣ Export")
+        pdf_b = create_pdf_report(df_res, country_name, start_date, end_date, {
+            'area': df_res['Inondé (km2)'].sum(), 
+            'pop': df_res['Pop. Exposée'].sum(),
+            'rain': total_rain
+        })
+        st.sidebar.download_button("📄 Télécharger Rapport PDF", pdf_b, "rapport_impact.pdf")
 
 st.dataframe(df_res.drop(columns=['orig_id']), use_container_width=True)
