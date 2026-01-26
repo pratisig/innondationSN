@@ -1,0 +1,9 @@
+# requirements.txt
+streamlit
+earthengine-api
+geemap
+geopandas
+folium
+streamlit-folium
+pandas
+plotly
