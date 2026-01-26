@@ -1,14 +1,13 @@
 # ======================================================
-# Flood Infra Tracker Sénégal – V1 (VERSION STREAMLIT CLOUD SAFE)
+# Flood Infra Tracker Sénégal – V1 (ULTRA STREAMLIT CLOUD SAFE)
 # ❌ geopandas supprimé
-# ✅ OSMnx + Shapely + Folium uniquement
+# ❌ osmnx supprimé
+# ✅ Overpass API + Folium uniquement
 # ======================================================
 
 import streamlit as st
-import osmnx as ox
 import folium
 from streamlit_folium import st_folium
-from shapely.geometry import Point
 from datetime import datetime
 import requests
 
@@ -22,7 +21,7 @@ st.set_page_config(
 )
 
 st.title("🌊 Flood Infra Tracker – Sénégal")
-st.caption("Suivi institutionnel des infrastructures exposées aux inondations")
+st.caption("Suivi institutionnel des infrastructures exposées aux inondations (OSM + pluie)")
 
 # ======================================================
 # SIDEBAR
@@ -48,31 +47,43 @@ rain_threshold = st.sidebar.slider(
 run = st.sidebar.button("Lancer l'analyse")
 
 # ======================================================
-# FONCTIONS
+# FONCTIONS DONNÉES
 # ======================================================
 
-def get_osm_objects(place):
-    tags = {
-        "highway": True,
-        "bridge": True,
-        "amenity": ["school", "hospital", "clinic"]
-    }
-    gdf = ox.geometries_from_place(place, tags)
-    gdf = gdf[gdf.geometry.notnull()]
-    gdf = gdf.to_crs(epsg=4326)
-    return gdf
+def get_osm_points(place):
+    """
+    Télécharge routes (simplifiées), ponts, écoles, centres de santé
+    via Overpass API (sans dépendances lourdes)
+    """
+    query = f"""
+    [out:json][timeout:60];
+    area[name="{place}"]->.searchArea;
+    (
+      node["amenity"="school"](area.searchArea);
+      node["amenity"="hospital"](area.searchArea);
+      node["amenity"="clinic"](area.searchArea);
+      node["bridge"](area.searchArea);
+    );
+    out center;
+    """
+
+    r = requests.post(
+        "https://overpass-api.de/api/interpreter",
+        data=query
+    )
+    data = r.json()
+    return data["elements"]
 
 
-def classify(row):
-    if row.get("bridge"):
-        return "Pont"
-    if row.get("amenity") == "school":
+def classify_osm(el):
+    tags = el.get("tags", {})
+    if tags.get("amenity") == "school":
         return "École"
-    if row.get("amenity") in ["hospital", "clinic"]:
+    if tags.get("amenity") in ["hospital", "clinic"]:
         return "Centre de santé"
-    if row.get("highway"):
-        return "Route"
-    return "Autre"
+    if "bridge" in tags:
+        return "Pont"
+    return "Infrastructure"
 
 
 def get_nasa_rain(lat, lon, start, end):
@@ -87,8 +98,7 @@ def get_nasa_rain(lat, lon, start, end):
         "format": "JSON"
     }
     r = requests.get(url, params=params, timeout=30)
-    data = r.json()
-    values = data["properties"]["parameter"]["PRECTOTCORR"]
+    values = r.json()["properties"]["parameter"]["PRECTOTCORR"]
     return sum(values.values())
 
 # ======================================================
@@ -96,21 +106,21 @@ def get_nasa_rain(lat, lon, start, end):
 # ======================================================
 
 if run:
-    with st.spinner("Chargement OSM..."):
-        gdf = get_osm_objects(place)
+    with st.spinner("Téléchargement des infrastructures depuis OSM..."):
+        elements = get_osm_points(place)
 
-    gdf["type"] = gdf.apply(classify, axis=1)
+    if not elements:
+        st.error("Aucune donnée OSM trouvée pour cette zone")
+        st.stop()
 
-    st.success(f"{len(gdf)} objets chargés depuis OSM")
+    # Centroid approximatif
+    lats = [el.get("lat") for el in elements if "lat" in el]
+    lons = [el.get("lon") for el in elements if "lon" in el]
 
-    centroid = gdf.geometry.unary_union.centroid
+    center_lat = sum(lats) / len(lats)
+    center_lon = sum(lons) / len(lons)
 
-    rain = get_nasa_rain(
-        centroid.y,
-        centroid.x,
-        start_date,
-        end_date
-    )
+    rain = get_nasa_rain(center_lat, center_lon, start_date, end_date)
 
     st.metric("Pluie cumulée (mm)", round(rain, 1))
 
@@ -130,21 +140,26 @@ if run:
     # MAP
     # ==================================================
     m = folium.Map(
-        location=[centroid.y, centroid.x],
+        location=[center_lat, center_lon],
         zoom_start=7,
         tiles="OpenStreetMap"
     )
 
-    for _, row in gdf.iterrows():
-        geom = row.geometry
-        if geom.geom_type == "Point":
+    stats = {"École": 0, "Centre de santé": 0, "Pont": 0}
+
+    for el in elements:
+        if "lat" in el and "lon" in el:
+            infra_type = classify_osm(el)
+            if infra_type in stats:
+                stats[infra_type] += 1
+
             folium.CircleMarker(
-                location=[geom.y, geom.x],
+                location=[el["lat"], el["lon"]],
                 radius=5,
                 color=color,
                 fill=True,
                 fill_opacity=0.8,
-                popup=f"Type : {row['type']}<br>Exposition : {exposure}"
+                popup=f"Type : {infra_type}<br>Exposition : {exposure}"
             ).add_to(m)
 
     st_folium(m, height=600, width=1200)
@@ -155,9 +170,9 @@ if run:
     st.subheader("Indicateurs clés")
 
     col1, col2, col3 = st.columns(3)
-    col1.metric("Routes", (gdf.type == "Route").sum())
-    col2.metric("Ponts", (gdf.type == "Pont").sum())
-    col3.metric("Infrastructures critiques", gdf.type.isin(["École", "Centre de santé"]).sum())
+    col1.metric("Écoles", stats["École"])
+    col2.metric("Centres de santé", stats["Centre de santé"])
+    col3.metric("Ponts", stats["Pont"])
 
     # ==================================================
     # SIGNALEMENT
@@ -173,4 +188,4 @@ if run:
         if submit:
             st.success("Signalement enregistré (V1 local)")
 
-st.caption("Prototype institutionnel – OSM + NASA POWER")
+st.caption("Prototype institutionnel – OSM (Overpass) + NASA POWER")
