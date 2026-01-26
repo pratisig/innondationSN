@@ -7,3 +7,4 @@ folium
 streamlit-folium
 pandas
 plotly
+osmnx 
