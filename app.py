@@ -91,15 +91,13 @@ def get_true_area_km2(geom_shapely):
     return area / 1e6
 
 # ------------------------------------------------------------
-# DATASETS - Correction des chemins OSM
+# DATASETS - Utilisation de OSM Combined (Source GEE officielle)
 # ------------------------------------------------------------
 GAUL = ee.FeatureCollection("FAO/GAUL/2015/level2")
 GAUL_A1 = ee.FeatureCollection("FAO/GAUL/2015/level1")
 
-# Utilisation des collections OSM globales (High Resolution)
-OSM_BUILDINGS = ee.FeatureCollection("MSFP/Buildings/v1") # Microsoft Buildings (souvent plus complet)
-# Pour les types spécifiques OSM, on utilise la collection communautaire ou filtrée
-OSM_DATA = ee.FeatureCollection("projects/google/osm/latest") # Chemin générique mis à jour
+# Collection OSM officielle de Google Earth Engine
+OSM_FEATURES = ee.FeatureCollection("projects/google/osm/combined")
 
 # ------------------------------------------------------------
 # SIDEBAR - CASCADE ADMINISTRATIVE
@@ -181,17 +179,13 @@ def analyze_infrastructure_impact(flood_img, aoi_ee):
     # Buffer de l'inondation pour l'intersection vectorielle
     flood_vec = flood_img.reduceToVectors(geometry=aoi_ee, scale=100, eightConnected=True)
     
-    # Correction des accès : on utilise un filtre global sur les points d'intérêt et lignes OSM
-    # Bâtiments (Microsoft Buildings est une alternative stable)
-    buildings = OSM_BUILDINGS.filterBounds(aoi_ee)
+    # Extraction des bâtiments depuis la collection OSM combined
+    buildings = OSM_FEATURES.filterBounds(aoi_ee).filter(ee.Filter.isNotNull(['building']))
     affected_buildings = buildings.filterBounds(flood_vec)
     
-    # Routes (via TIGER ou OSM)
-    roads = ee.FeatureCollection("TIGER/2016/Roads").filterBounds(aoi_ee) # TIGER est plus stable dans GEE
+    # Extraction des routes (clé 'highway')
+    roads = OSM_FEATURES.filterBounds(aoi_ee).filter(ee.Filter.isNotNull(['highway']))
     affected_roads = roads.filterBounds(flood_vec)
-    
-    # Points d'intérêt (Santé, Education via OSM tags)
-    pois = ee.FeatureCollection("GOOGLE/Research/open-buildings/v3/polygons").filterBounds(aoi_ee)
     
     return affected_buildings, affected_roads
 
@@ -222,25 +216,19 @@ if analysis_mode == "Série Temporelle Animée":
 
 st.subheader("🗺️ Analyse d'Impact Spatiale & Infrastructures")
 
-with st.spinner("Analyse approfondie (Population & Infrastructures)..."):
+with st.spinner("Analyse approfondie (Population & OSM Combined)..."):
     flood_all, rain_all = get_flood_and_rain(geom_ee.getInfo(), str(start_date), str(end_date))
     pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").filterBounds(geom_ee).mean().select(0)
 
     if flood_all:
         aff_buildings, aff_roads = analyze_infrastructure_impact(flood_all, geom_ee)
         
-        # Categorisation par tags (Santé, Education)
-        # Note: On utilise des filtres sur les métadonnées OSM si disponibles
-        health_aff = aff_buildings.filter(ee.Filter.Or(
-            ee.Filter.eq('amenity', 'hospital'),
-            ee.Filter.eq('amenity', 'clinic'),
-            ee.Filter.eq('building', 'hospital')
-        ))
-        edu_aff = aff_buildings.filter(ee.Filter.Or(
-            ee.Filter.eq('amenity', 'school'),
-            ee.Filter.eq('amenity', 'university'),
-            ee.Filter.eq('building', 'school')
-        ))
+        # Categorisation par tags OSM (Santé, Education)
+        health_tags = ['hospital', 'clinic', 'doctors', 'pharmacy']
+        edu_tags = ['school', 'university', 'kindergarten', 'college']
+        
+        health_aff = aff_buildings.filter(ee.Filter.inList('amenity', health_tags))
+        edu_aff = aff_buildings.filter(ee.Filter.inList('amenity', edu_tags))
 
         rain_stats = safe_get_info(rain_all.reduceRegion(ee.Reducer.mean(), geom_ee, 2000))
         total_rain = rain_stats.get('precip', 0) if rain_stats else 0
@@ -255,13 +243,11 @@ with st.spinner("Analyse approfondie (Population & Infrastructures)..."):
                 pop_img.updateMask(flood_all.select(0)).rename('p_exp')
             ]).reduceRegion(ee.Reducer.sum(), f_geom, 250))
             
-            # Stats Infrastructures
+            # Stats Infrastructures OSM
             b_count = safe_get_info(aff_buildings.filterBounds(f_geom).size())
             h_count = safe_get_info(health_aff.filterBounds(f_geom).size())
             e_count = safe_get_info(edu_aff.filterBounds(f_geom).size())
-            
-            # Calcul longueur routes (TIGER utilise 'length' ou on calcule la géométrie)
-            r_count = safe_get_info(aff_roads.filterBounds(f_geom).size()) # Nombre de segments affectés
+            r_count = safe_get_info(aff_roads.filterBounds(f_geom).size())
             
             f_km2 = (loc_stats.get('f_area', 0) if loc_stats else 0) / 1e6
             p_exp = (loc_stats.get('p_exp', 0) if loc_stats else 0)
@@ -293,7 +279,7 @@ with st.spinner("Analyse approfondie (Population & Infrastructures)..."):
         st_folium(m, width="100%", height=500)
 
         st.write("---")
-        st.markdown("### 📊 Tableau de Bord des Dommages")
+        st.markdown("### 📊 Tableau de Bord des Dommages (OSM)")
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Pop. Exposée", f"{df_res['Pop. Exposée'].sum():,}")
         c2.metric("Bâtiments", f"{df_res['Bâtiments'].sum():,}")
@@ -302,7 +288,6 @@ with st.spinner("Analyse approfondie (Population & Infrastructures)..."):
         c5.metric("🛣️ Routes (segments)", f"{df_res['Segments Route'].sum():,}")
 
         st.sidebar.header("3️⃣ Export")
-        # Adaptation pour inclure les nouveaux indicateurs dans le PDF
         pdf_b = create_pdf_report(df_res.rename(columns={'Bâtiments': 'Bâtiments Affectés', 'Segments Route': 'Routes Affectées (km)'}), country_name, start_date, end_date, {
             'area': df_res['Inondé (km2)'].sum(), 'pop': df_res['Pop. Exposée'].sum(),
             'buildings': df_res['Bâtiments'].sum(), 'roads': df_res['Segments Route'].sum(), 'rain': total_rain
