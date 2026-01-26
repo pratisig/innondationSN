@@ -86,8 +86,9 @@ else:
 # Conversion pour le traitement local
 with st.spinner("Chargement de la géométrie..."):
     # Limiter le nombre de features pour la performance de l'UI
-    gdf = gpd.GeoDataFrame.from_features(final_aoi_fc.getInfo(), crs="EPSG:4326")
-    # On s'assure que l'index est propre pour la correspondance
+    gdf_raw = final_aoi_fc.getInfo()
+    gdf = gpd.GeoDataFrame.from_features(gdf_raw, crs="EPSG:4326")
+    # On s'assure que l'index est propre et séquentiel pour la correspondance
     gdf = gdf.reset_index(drop=True)
     merged_poly = unary_union(gdf.geometry)
     geom_ee = ee.Geometry(mapping(merged_poly))
@@ -154,7 +155,7 @@ def compute_metrics(gdf_json, start, end):
     features = []
     for idx, row in gdf.iterrows():
         f = ee.Feature(ee.Geometry(mapping(row.geometry)), {
-            'orig_index': idx, 'nom': str(row[label_col]), 'area_km2': get_true_area_km2(row.geometry)
+            'orig_index': int(idx), 'nom': str(row[label_col]), 'area_km2': get_true_area_km2(row.geometry)
         })
         features.append(f)
     fc = ee.FeatureCollection(features)
@@ -178,14 +179,14 @@ with st.spinner("Calcul des statistiques d'impact..."):
         f_km2 = (p.get('f_area', 0)) / 1e6
         area_total = p.get('area_km2', 1)
         rows.append({
-            "orig_index": p['orig_index'],
+            "orig_index": int(p['orig_index']),
             "Zone": p['nom'],
             "Surface Totale (km2)": area_total,
             "Inondé (km2)": f_km2,
             "% Inondé": (f_km2 / area_total * 100),
             "Pop. Exposée": int(p.get('p_exp', 0)),
             "Bâtiments Impactés": int(p.get('b_exp', 0)),
-            "Précip. Cumulée (mm)": (p.get('rain', 0) / (area_total * 100)) # Approximation spatiale
+            "Précip. Cumulée (mm)": (p.get('rain', 0) / (area_total * 100)) if area_total > 0 else 0
         })
     df = pd.DataFrame(rows)
 
@@ -217,14 +218,19 @@ add_ee_layer(bldg_img.updateMask(flood_img), {'palette':['#FF0000']}, "Bâtiment
 
 # Polygons avec couleur selon l'impact
 for _, r in df.iterrows():
-    # Utilisation de l'index d'origine pour éviter les erreurs de sélection par nom
-    orig_geom = gdf.loc[r['orig_index']].geometry
-    color = "red" if r['% Inondé'] > 10 else "orange" if r['% Inondé'] > 2 else "green"
-    folium.GeoJson(
-        orig_geom,
-        style_function=lambda x, c=color: {"fillColor": c, "color": "black", "weight": 1, "fillOpacity": 0.4},
-        tooltip=f"{r['Zone']}: {r['% Inondé']:.1f}% inondé | {r['Pop. Exposée']:,} pers."
-    ).add_to(m)
+    try:
+        # Utilisation de iloc avec l'index positionnel préservé
+        idx = int(r['orig_index'])
+        if idx < len(gdf):
+            orig_geom = gdf.iloc[idx].geometry
+            color = "red" if r['% Inondé'] > 10 else "orange" if r['% Inondé'] > 2 else "green"
+            folium.GeoJson(
+                orig_geom,
+                style_function=lambda x, c=color: {"fillColor": c, "color": "black", "weight": 1, "fillOpacity": 0.4},
+                tooltip=f"{r['Zone']}: {r['% Inondé']:.1f}% inondé | {r['Pop. Exposée']:,} pers."
+            ).add_to(m)
+    except Exception as e:
+        continue
 
 folium.LayerControl().add_to(m)
 st_folium(m, width="100%", height=500)
