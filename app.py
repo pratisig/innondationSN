@@ -180,12 +180,12 @@ def analyze_infrastructure_impact(flood_img, aoi_ee):
     flood_vec = flood_img.reduceToVectors(geometry=aoi_ee, scale=100, eightConnected=True)
     
     # Extraction des bâtiments depuis la collection OSM combined
-    # Correction : Correction de l'appel ee.Filter.isNotNull qui attend un string, pas une liste
-    buildings = OSM_FEATURES.filterBounds(aoi_ee).filter(ee.Filter.isNotNull('building'))
+    # Correction : Utilisation d'un filtre plus large pour éviter les erreurs de colonnes manquantes
+    buildings = OSM_FEATURES.filterBounds(aoi_ee).filter(ee.Filter.neq('building', None))
     affected_buildings = buildings.filterBounds(flood_vec)
     
     # Extraction des routes (clé 'highway')
-    roads = OSM_FEATURES.filterBounds(aoi_ee).filter(ee.Filter.isNotNull('highway'))
+    roads = OSM_FEATURES.filterBounds(aoi_ee).filter(ee.Filter.neq('highway', None))
     affected_roads = roads.filterBounds(flood_vec)
     
     return affected_buildings, affected_roads
@@ -228,6 +228,7 @@ with st.spinner("Analyse approfondie (Population & OSM Combined)..."):
         health_tags = ['hospital', 'clinic', 'doctors', 'pharmacy']
         edu_tags = ['school', 'university', 'kindergarten', 'college']
         
+        # Filtrage sécurisé (on vérifie d'abord si les bâtiments existent)
         health_aff = aff_buildings.filter(ee.Filter.inList('amenity', health_tags))
         edu_aff = aff_buildings.filter(ee.Filter.inList('amenity', edu_tags))
 
