@@ -1,5 +1,6 @@
 # ============================================================
-# FLOOD IMPACT ANALYSIS APP — WEST AFRICA
+# FLOOD IMPACT ANALYSIS & PLANNING APP
+# West Africa – Sentinel / CHIRPS / WorldPop / OSM
 # ============================================================
 
 import streamlit as st
@@ -11,6 +12,7 @@ import folium
 from streamlit_folium import st_folium
 import tempfile, os, zipfile
 from shapely.ops import unary_union
+from shapely.geometry import mapping
 import plotly.express as px
 import osmnx as ox
 
@@ -23,11 +25,11 @@ st.set_page_config(
     page_icon="🌊"
 )
 
-st.title("🌊 Flood Impact Analysis & Emergency Planning")
-st.caption("Sentinel-1 / Sentinel-2 / CHIRPS / WorldPop / OpenStreetMap")
+st.title("🌊 Flood Impact Analysis & Emergency Planning Tool")
+st.caption("Sentinel-1 | Sentinel-2 | CHIRPS | WorldPop | OpenStreetMap")
 
 # ============================================================
-# EARTH ENGINE AUTH — SERVICE ACCOUNT ONLY
+# EARTH ENGINE AUTH (SERVICE ACCOUNT — CLOUD SAFE)
 # ============================================================
 @st.cache_resource
 def init_ee():
@@ -44,9 +46,8 @@ init_ee()
 # FILE UPLOAD
 # ============================================================
 st.sidebar.header("1️⃣ Zone d’étude")
-
 uploaded = st.sidebar.file_uploader(
-    "GeoJSON / SHP (zip)",
+    "GeoJSON ou SHP (ZIP)",
     type=["geojson", "zip"]
 )
 
@@ -69,34 +70,36 @@ with tempfile.TemporaryDirectory() as tmp:
 # CRS
 gdf = gdf.to_crs(4326)
 
-# Nom des zones
-if "name" not in gdf.columns:
-    gdf["name"] = [f"Zone {i+1}" for i in range(len(gdf))]
+# Nom des polygones
+name_col = next((c for c in gdf.columns if c.lower() in ["name", "nom", "libelle"]), None)
+if not name_col:
+    gdf["zone_name"] = [f"Zone {i+1}" for i in range(len(gdf))]
+    name_col = "zone_name"
 
 # ============================================================
-# SURFACE CORRECTE (UTM)
+# SURFACES CORRECTES (PROJECTION MÉTRIQUE)
 # ============================================================
-gdf_utm = gdf.to_crs(32628)  # Sénégal
+gdf_utm = gdf.to_crs(32628)  # Sénégal / Afrique Ouest
 gdf["area_km2"] = gdf_utm.area / 1e6
 
 # ============================================================
-# GEE GEOMETRY
+# GEE AOI
 # ============================================================
-aoi = unary_union(gdf.geometry)
-ee_geom = ee.Geometry(aoi.__geo_interface__)
+aoi_geom = unary_union(gdf.geometry)
+ee_geom = ee.Geometry(mapping(aoi_geom))
 
 # ============================================================
-# DATE
+# DATES
 # ============================================================
-st.sidebar.header("2️⃣ Période")
+st.sidebar.header("2️⃣ Période d’analyse")
 start = st.sidebar.date_input("Début", pd.to_datetime("2024-08-01"))
 end = st.sidebar.date_input("Fin", pd.to_datetime("2024-09-30"))
 
 # ============================================================
-# FLOOD DETECTION — SENTINEL-1
+# SENTINEL-1 FLOOD DETECTION
 # ============================================================
 @st.cache_data
-def flood_map(aoi_json, s, e):
+def detect_flood(aoi_json, s, e):
     geom = ee.Geometry(aoi_json)
 
     s1 = (
@@ -118,64 +121,66 @@ def flood_map(aoi_json, s, e):
 
     return flood.updateMask(slope.lt(5)).updateMask(perm.lt(10)).selfMask()
 
-flood = flood_map(ee_geom.getInfo(), start, end)
+flood = detect_flood(ee_geom.getInfo(), start, end)
 
 # ============================================================
-# INDICATEURS GLOBAUX
+# INDICATEURS GLOBAUX (ROBUSTES)
 # ============================================================
 pixel_area = ee.Image.pixelArea()
 
-flood_area = flood.multiply(pixel_area).reduceRegion(
-    ee.Reducer.sum(), ee_geom, 100, maxPixels=1e13
-).get("VV")
+flood_stats = flood.multiply(pixel_area).reduceRegion(
+    reducer=ee.Reducer.sum(),
+    geometry=ee_geom,
+    scale=100,
+    maxPixels=1e13,
+    bestEffort=True
+)
 
-flood_km2 = ee.Number(flood_area).divide(1e6).getInfo()
+flood_area_m2 = flood_stats.get("VV")
+flood_km2 = ee.Number(flood_area_m2).divide(1e6).getInfo() if flood_area_m2 else 0
 
 rain = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY") \
     .filterBounds(ee_geom).filterDate(str(start), str(end)).sum()
 
 rain_mm = rain.reduceRegion(
     ee.Reducer.mean(), ee_geom, 5000, maxPixels=1e13
-).get("precipitation").getInfo()
+).get("precipitation").getInfo() or 0
 
 pop = ee.ImageCollection("WorldPop/GP/100m/pop").mean()
 
 pop_exp = pop.updateMask(flood).reduceRegion(
     ee.Reducer.sum(), ee_geom, 100, maxPixels=1e13
-).get("population").getInfo()
+).get("population").getInfo() or 0
 
 # ============================================================
-# DISPLAY METRICS
+# METRICS
 # ============================================================
 st.subheader("📊 Indicateurs clés")
-
 c1, c2, c3 = st.columns(3)
 c1.metric("Surface inondée", f"{flood_km2:.2f} km²")
 c2.metric("Population exposée", f"{int(pop_exp):,}")
 c3.metric("Pluie cumulée", f"{rain_mm:.1f} mm")
 
 # ============================================================
-# OSM — INFRASTRUCTURES EXPOSÉES
+# OSM — INFRASTRUCTURES
 # ============================================================
-st.subheader("🏗️ Infrastructures exposées")
+st.subheader("🏗️ Infrastructures exposées (OSM)")
 
 tags = {
+    "building": True,
     "amenity": True,
-    "highway": True,
-    "building": True
+    "highway": True
 }
 
-osm = ox.geometries_from_polygon(aoi, tags)
+osm = ox.geometries_from_polygon(aoi_geom, tags)
 osm = osm.to_crs(32628)
 
-# Approximation exposition
-osm["exposed"] = osm.intersects(unary_union(gdf_utm.geometry))
-
-infra_stats = osm["exposed"].value_counts()
+infra_total = len(osm)
+infra_exposed = osm.intersects(unary_union(gdf_utm.geometry)).sum()
 
 st.write({
-    "Total infrastructures": len(osm),
-    "Infrastructures exposées": int(infra_stats.get(True, 0))
+    "Total infrastructures détectées": int(infra_total),
+    "Infrastructures exposées (zone inondable)": int(infra_exposed)
 })
 
 # ============================================================
@@ -199,15 +204,16 @@ folium.TileLayer(
     opacity=0.6
 ).add_to(m)
 
-# Zones + popup
+# Zones + popups
 for _, r in gdf.iterrows():
-    html = f"""
-    <b>{r['name']}</b><br>
+    popup = f"""
+    <b>{r[name_col]}</b><br>
     Surface totale : {r['area_km2']:.2f} km²<br>
+    % de la zone inondable (globale) : {(flood_km2/r['area_km2']*100 if r['area_km2']>0 else 0):.1f} %
     """
     folium.GeoJson(
         r.geometry,
-        popup=html,
+        popup=popup,
         style_function=lambda x: {"color":"red","weight":2,"fillOpacity":0}
     ).add_to(m)
 
@@ -215,11 +221,11 @@ folium.LayerControl().add_to(m)
 st_folium(m, height=600)
 
 # ============================================================
-# TABLE RÉCAP
+# TABLE RÉCAPITULATIVE
 # ============================================================
 st.subheader("📋 Tableau récapitulatif")
 
-df = gdf[["name","area_km2"]].copy()
+df = gdf[[name_col, "area_km2"]].copy()
 df["Flood_km2_est"] = flood_km2 * (df["area_km2"] / df["area_km2"].sum())
 df["% Inondée"] = (df["Flood_km2_est"] / df["area_km2"]) * 100
 
