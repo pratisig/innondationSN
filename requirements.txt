@@ -9,3 +9,4 @@ pandas
 plotly
 osmnx 
 reportlab
+fpdf
