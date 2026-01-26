@@ -104,6 +104,10 @@ if uploaded_file:
             geom = shapely_to_ee(merged_poly)
             
             st.success("✅ Géométrie convertie avec succès pour Google Earth Engine.")
+            except Exception as e:
+            st.error(f"Erreur lors du traitement de la géométrie : {e}")
+else:
+    st.info("Veuillez charger un fichier pour générer la géométrie GEE.")
 
 # ------------------------------------------------------------
 # DATE SELECTION
