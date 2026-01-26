@@ -1,6 +1,6 @@
 # ============================================================
 # FLOOD ANALYSIS & EMERGENCY PLANNING APP
-# West Africa – Sentinel / CHIRPS / WorldPop / OSM / WFP
+# West Africa – Sentinel / CHIRPS / WorldPop / OSM / FAO GAUL
 # ============================================================
 
 import streamlit as st
@@ -26,7 +26,7 @@ st.set_page_config(
     page_icon="🌊"
 )
 st.title("🌊 Analyse d'Impact Inondations & Planification d'Urgence")
-st.caption("Sentinel-1 | CHIRPS | WorldPop | OSM | WFP/VAM (Admin 1-4)")
+st.caption("Sentinel-1 | CHIRPS | WorldPop | OSM | FAO GAUL (Admin 1-3)")
 
 # ------------------------------------------------------------
 # INIT GEE
@@ -70,18 +70,17 @@ def create_pdf_report(df, country, p1, p2, stats):
     pdf.set_font("Arial", "B", 14)
     pdf.cell(190, 10, "2. Detail par Zone Administrative", ln=True)
     pdf.set_font("Arial", "B", 8)
-    cols = ["Zone", "Surf. (km2)", "% Inon", "Pop. Exp", "Infras", "Pluie(mm)"]
-    for col in cols: pdf.cell(31, 8, col, border=1)
+    cols = ["Zone", "Surf. (km2)", "% Inon", "Pop. Exp", "Pluie(mm)"]
+    for col in cols: pdf.cell(38, 8, col, border=1)
     pdf.ln()
     
     pdf.set_font("Arial", "", 8)
     for _, row in df.iterrows():
-        pdf.cell(31, 8, str(row['Zone'])[:18], border=1)
-        pdf.cell(31, 8, f"{row['Inondé (km2)']:.2f}", border=1)
-        pdf.cell(31, 8, f"{row['% Inondé']:.1f}%", border=1)
-        pdf.cell(31, 8, f"{row['Pop. Exposée']:,}", border=1)
-        pdf.cell(31, 8, f"{row.get('Infras', 0)}", border=1)
-        pdf.cell(31, 8, f"{row.get('Pluie(mm)', 0):.1f}", border=1, ln=True)
+        pdf.cell(38, 8, str(row['Zone'])[:22], border=1)
+        pdf.cell(38, 8, f"{row['Inondé (km2)']:.2f}", border=1)
+        pdf.cell(38, 8, f"{row['% Inondé']:.1f}%", border=1)
+        pdf.cell(38, 8, f"{row['Pop. Exposée']:,}", border=1)
+        pdf.cell(38, 8, f"{row.get('Pluie(mm)', 0):.1f}", border=1, ln=True)
         
     return pdf.output(dest='S').encode('latin-1')
 
@@ -91,10 +90,11 @@ def get_true_area_km2(geom_shapely):
     return area / 1e6
 
 # ------------------------------------------------------------
-# DATASETS - WFP VAM
+# DATASETS - FAO GAUL (Stable Source for Admin 0-2)
 # ------------------------------------------------------------
-# Correction: Utilisation de la collection FAO GAUL pour la stabilité ou vérification des noms de colonnes WFP
-WFP = ee.FeatureCollection("projects/wfp-vam-stats/admin_boundaries/global_admin_boundaries")
+# FAO GAUL 2015 est la collection la plus complète pour l'Admin 2 (Départements/Communes)
+GAUL = ee.FeatureCollection("FAO/GAUL/2015/level2")
+GAUL_A1 = ee.FeatureCollection("FAO/GAUL/2015/level1")
 
 # ------------------------------------------------------------
 # SIDEBAR - CASCADE ADMINISTRATIVE
@@ -102,55 +102,37 @@ WFP = ee.FeatureCollection("projects/wfp-vam-stats/admin_boundaries/global_admin
 st.sidebar.header("1️⃣ Sélection Administrative")
 country_name = st.sidebar.selectbox("Pays", ["Senegal", "Mali", "Mauritania", "Gambia", "Guinea"])
 
-# Correction des noms de colonnes (souvent en majuscules dans cette collection spécifique)
-C0, C1, C2, C3 = 'adm0_name', 'adm1_name', 'adm2_name', 'adm3_name'
+# Mapping des noms de colonnes GAUL
+C0 = 'ADM0_NAME'
+C1 = 'ADM1_NAME'
+C2 = 'ADM2_NAME'
 
 def safe_get_info(ee_obj):
     try:
         return ee_obj.getInfo()
     except Exception as e:
-        st.error(f"Erreur de communication avec Google Earth Engine. Veuillez réessayer. ({e})")
+        st.error(f"Erreur GEE : {e}")
         return None
 
 # Admin 1
-a1_fc = WFP.filter(ee.Filter.eq(C0, country_name))
-a1_list_raw = safe_get_info(a1_fc.aggregate_array(C1).distinct().sort())
+a1_fc = GAUL_A1.filter(ee.Filter.eq(C0, country_name))
+a1_list = safe_get_info(a1_fc.aggregate_array(C1).distinct().sort())
 
-if a1_list_raw is None:
-    st.warning("Impossible de récupérer les régions. Vérification des noms de colonnes...")
-    # Fallback si minuscule échoue
-    C0, C1, C2, C3 = 'ADM0_NAME', 'ADM1_NAME', 'ADM2_NAME', 'ADM3_NAME'
-    a1_fc = WFP.filter(ee.Filter.eq(C0, country_name))
-    a1_list_raw = safe_get_info(a1_fc.aggregate_array(C1).distinct().sort())
-
-sel_a1 = st.sidebar.multiselect("Régions (Admin 1)", a1_list_raw if a1_list_raw else [])
+sel_a1 = st.sidebar.multiselect("Régions (Admin 1)", a1_list if a1_list else [])
 
 final_aoi_fc = None
 label_col = C1
 
 if sel_a1:
     # Admin 2
-    a2_fc = WFP.filter(ee.Filter.inList(C1, sel_a1))
+    a2_fc = GAUL.filter(ee.Filter.eq(C0, country_name)).filter(ee.Filter.inList(C1, sel_a1))
     a2_list = safe_get_info(a2_fc.aggregate_array(C2).distinct().sort())
-    sel_a2 = st.sidebar.multiselect("Départements (Admin 2)", a2_list if a2_list else [])
+    
+    sel_a2 = st.sidebar.multiselect("Départements/Zones (Admin 2)", a2_list if a2_list else [])
     
     if sel_a2:
-        # Admin 3
-        a3_fc = WFP.filter(ee.Filter.inList(C2, sel_a2))
-        a3_list = safe_get_info(a3_fc.aggregate_array(C3).distinct().sort())
-        
-        if a3_list:
-            a3_list = [x for x in a3_list if x] # Nettoyage des valeurs nulles
-            sel_a3 = st.sidebar.multiselect("Communes (Admin 3)", a3_list)
-            if sel_a3:
-                final_aoi_fc = a3_fc.filter(ee.Filter.inList(C3, sel_a3))
-                label_col = C3
-            else:
-                final_aoi_fc = a3_fc
-                label_col = C2
-        else:
-            final_aoi_fc = a2_fc
-            label_col = C2
+        final_aoi_fc = a2_fc.filter(ee.Filter.inList(C2, sel_a2))
+        label_col = C2
     else:
         final_aoi_fc = a1_fc.filter(ee.Filter.inList(C1, sel_a1))
         label_col = C1
@@ -161,7 +143,7 @@ else:
 with st.spinner("Chargement de la zone d'étude..."):
     aoi_info = safe_get_info(final_aoi_fc)
     if not aoi_info or not aoi_info['features']:
-        st.error("Aucune géométrie trouvée. La sélection est peut-être trop large ou invalide.")
+        st.error("Aucune géométrie trouvée.")
         st.stop()
         
     gdf = gpd.GeoDataFrame.from_features(aoi_info, crs="EPSG:4326")
@@ -186,7 +168,8 @@ def get_flood_and_rain(aoi_json, start_str, end_str):
     s1 = ee.ImageCollection("COPERNICUS/S1_GRD").filterBounds(aoi).filterDate(start_str, end_str)\
            .filter(ee.Filter.eq("instrumentMode","IW")).select("VV")
     
-    if safe_get_info(s1.size()) < 1: return None, None
+    count = safe_get_info(s1.size())
+    if count is None or count < 1: return None, None
     
     ref = ee.ImageCollection("COPERNICUS/S1_GRD").filterBounds(aoi).filterDate("2024-01-01", "2024-03-31").median()
     flood = s1.median().subtract(ref).lt(-3)
@@ -196,7 +179,7 @@ def get_flood_and_rain(aoi_json, start_str, end_str):
     return flood.updateMask(slope.lt(5)).selfMask(), rain
 
 # ------------------------------------------------------------
-# ANIMATION
+# ANIMATION & IMPACT
 # ------------------------------------------------------------
 if analysis_mode == "Série Temporelle Animée":
     st.subheader("🎞️ Évolution Temporelle des Inondations")
@@ -209,7 +192,7 @@ if analysis_mode == "Série Temporelle Animée":
             d1, d2 = str(dates[i].date()), str(dates[i+1].date())
             f, r = get_flood_and_rain(geom_ee.getInfo(), d1, d2)
             if f:
-                area_res = safe_get_info(f.multiply(ee.Image.pixelArea()).reduceRegion(ee.Reducer.sum(), geom_ee, 250))
+                area_res = safe_get_info(f.multiply(ee.Image.pixelArea()).reduceRegion(ee.Reducer.sum(), geom_ee, 300))
                 area_val = area_res.get('VV', 0) if area_res else 0
                 ts_rows.append({"Date": d1, "Surface (km2)": (area_val/1e6) if area_val else 0})
                 images.append(f.visualize(palette=['#00D4FF']))
@@ -219,19 +202,15 @@ if analysis_mode == "Série Temporelle Animée":
             gif_url = ee.ImageCollection(images).getVideoThumbURL({
                 'dimensions': 600, 'region': geom_ee, 'framesPerSecond': 2, 'crs': 'EPSG:3857'
             })
-            col_a.image(gif_url, use_container_width=True, caption="Animation de l'eau détectée (Bleu)")
-            col_b.write("**Série chronologique :**")
+            col_a.image(gif_url, use_container_width=True, caption="Eau détectée par Sentinel-1")
+            col_b.write("**Graphique de surface (km²)**")
             col_b.line_chart(pd.DataFrame(ts_rows).set_index("Date"))
 
-# ------------------------------------------------------------
-# IMPACT ANALYSIS
-# ------------------------------------------------------------
 st.subheader("🗺️ Carte d'Impact & Statistiques")
 
 with st.spinner("Analyse des impacts spatiaux..."):
     flood_all, rain_all = get_flood_and_rain(geom_ee.getInfo(), str(start_date), str(end_date))
     pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").filterBounds(geom_ee).mean()
-    buildings = ee.FeatureCollection("GOOGLE/Research/open-buildings/v3/polygons").filterBounds(geom_ee)
 
     if flood_all:
         rain_stats = safe_get_info(rain_all.reduceRegion(ee.Reducer.mean(), geom_ee, 2000))
@@ -245,8 +224,8 @@ with st.spinner("Analyse des impacts spatiaux..."):
                 pop_img.updateMask(flood_all).rename('p_exp')
             ]).reduceRegion(ee.Reducer.sum(), f_geom, 250))
             
-            t_pop = safe_get_info(pop_img.reduceRegion(ee.Reducer.sum(), f_geom, 250))
-            t_pop_val = t_pop.get('population', 0) if t_pop else 0
+            t_pop_res = safe_get_info(pop_img.reduceRegion(ee.Reducer.sum(), f_geom, 250))
+            t_pop_val = t_pop_res.get('population', 0) if t_pop_res else 0
             
             f_km2 = (loc_stats.get('f_area', 0) if loc_stats else 0) / 1e6
             p_exp = (loc_stats.get('p_exp', 0) if loc_stats else 0)
@@ -270,20 +249,13 @@ with st.spinner("Analyse des impacts spatiaux..."):
 
         for _, r in df_res.iterrows():
             geom = gdf.iloc[int(r['orig_id'])].geometry
-            pop_html = f"""
-                <div style='font-family:sans-serif; min-width:200px'>
-                    <h4 style='color:#00D4FF'>{r['Zone']}</h4>
-                    <hr>
-                    <b>Superficie Inondée:</b> {r['Inondé (km2)']} km² ({r['% Inondé']}%)<br>
-                    <b>Pop. Exposée:</b> <span style='color:red'>{r['Pop. Exposée']:,}</span>
-                </div>
-            """
+            pop_html = f"<b>{r['Zone']}</b><br>Inondé: {r['Inondé (km2)']} km²<br>Pop Exposée: {r['Pop. Exposée']:,}"
             folium.GeoJson(
                 geom,
                 style_function=lambda x, c=("red" if r['% Inondé']>5 else "orange"): {
                     'fillColor': c, 'color': 'white', 'weight': 1, 'fillOpacity': 0.2
                 },
-                popup=folium.Popup(pop_html)
+                popup=folium.Popup(pop_html, max_width=200)
             ).add_to(m)
 
         st_folium(m, width="100%", height=500)
@@ -302,4 +274,5 @@ with st.spinner("Analyse des impacts spatiaux..."):
         })
         st.sidebar.download_button("📄 Télécharger Rapport PDF", pdf_b, "rapport_impact.pdf")
 
-st.dataframe(df_res.drop(columns=['orig_id']), use_container_width=True)
+if 'df_res' in locals():
+    st.dataframe(df_res.drop(columns=['orig_id']), use_container_width=True)
