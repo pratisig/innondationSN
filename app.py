@@ -3,10 +3,6 @@
 # FLOOD ANALYSIS & MAPPING APP — SENEGAL / WEST AFRICA
 # Uses real open data via Google Earth Engine (GEE)
 # ============================================================
-# REQUIREMENTS:
-# - Google Earth Engine account enabled
-# - Service Account JSON uploaded as Streamlit secret or local file
-# ============================================================
 
 import streamlit as st
 import ee
@@ -18,6 +14,7 @@ import os
 import json
 import pandas as pd
 import plotly.express as px
+from shapely.geometry import Polygon, MultiPolygon
 
 # ------------------------------------------------------------
 # PAGE CONFIG
@@ -36,7 +33,6 @@ st.caption("Satellite-based flood detection using Sentinel-1 SAR and open datase
 # ------------------------------------------------------------
 @st.cache_resource
 def init_gee():
-    import ee, json
     key = json.loads(st.secrets["GEE_SERVICE_ACCOUNT"])
     credentials = ee.ServiceAccountCredentials(
         key["client_email"],
@@ -45,8 +41,10 @@ def init_gee():
     ee.Initialize(credentials)
     return True
 
+init_gee()
+
 # ------------------------------------------------------------
-# FILE UPLOAD
+# FILE UPLOAD & EE GEOMETRY CONVERSION
 # ------------------------------------------------------------
 st.sidebar.header("1️⃣ Zone d’étude")
 uploaded_file = st.sidebar.file_uploader(
@@ -58,7 +56,6 @@ if not uploaded_file:
     st.info("Veuillez charger une zone géographique pour commencer.")
     st.stop()
 
-# Save uploaded file temporarily
 with tempfile.TemporaryDirectory() as tmpdir:
     file_path = os.path.join(tmpdir, uploaded_file.name)
     with open(file_path, "wb") as f:
@@ -66,8 +63,37 @@ with tempfile.TemporaryDirectory() as tmpdir:
 
     gdf = gpd.read_file(file_path)
 
-# Convert to EE Geometry
-geom = ee.Geometry.Polygon(gdf.geometry.iloc[0].__geo_interface__["coordinates"])
+# Fonction pour convertir Shapely → EE Geometry
+def shapely_to_ee(poly):
+    if isinstance(poly, Polygon):
+        coords = [list(poly.exterior.coords)]
+        for interior in poly.interiors:
+            coords.append(list(interior.coords))
+    elif isinstance(poly, MultiPolygon):
+        coords = []
+        for p in poly.geoms:
+            part = [list(p.exterior.coords)]
+            for interior in p.interiors:
+                part.append(list(interior.coords))
+            coords.append(part)
+    else:
+        st.error(f"Type de géométrie non supporté: {type(poly)}. Veuillez charger un Polygon ou MultiPolygon.")
+        st.stop()
+
+    # Assurer l'ordre [lon, lat]
+    def swap_xy(ring):
+        return [(x, y) for x, y in ring]
+
+    if isinstance(poly, Polygon):
+        coords = [swap_xy(ring) for ring in coords]
+    else:
+        coords = [[swap_xy(ring) for ring in part] for part in coords]
+
+    return ee.Geometry.Polygon(coords)
+
+poly = gdf.geometry.iloc[0]
+geom = shapely_to_ee(poly)
+st.success("✅ Zone d’étude chargée et convertie avec succès.")
 
 # ------------------------------------------------------------
 # DATE SELECTION
@@ -98,7 +124,6 @@ def detect_floods(aoi, start, end):
     after = s1.filterDate(str(pd.to_datetime(end) - pd.Timedelta(days=7)), str(end)).median()
 
     diff = after.subtract(before)
-
     flood = diff.lt(-3)  # SAR adaptive threshold
     flood = flood.updateMask(flood)
 
@@ -159,7 +184,6 @@ pop_exposed = pop.updateMask(flood_img).reduceRegion(
 # DISPLAY METRICS
 # ------------------------------------------------------------
 st.subheader("📊 Indicateurs clés")
-
 col1, col2, col3 = st.columns(3)
 col1.metric("Surface inondée (km²)", flood_area_km2.getInfo())
 col2.metric("Pluie cumulée (mm)", rain_mm.getInfo())
@@ -169,7 +193,6 @@ col3.metric("Population exposée", pop_exposed.getInfo())
 # MAP
 # ------------------------------------------------------------
 st.subheader("🗺️ Carte interactive")
-
 m = folium.Map(location=[14.5, -14.5], zoom_start=7)
 folium.GeoJson(gdf, name="Zone d’étude").add_to(m)
 
@@ -182,7 +205,6 @@ flood_layer = folium.raster_layers.TileLayer(
     control=True
 )
 flood_layer.add_to(m)
-
 folium.LayerControl().add_to(m)
 st_folium(m, width=1100, height=600)
 
