@@ -1,270 +1,221 @@
-# ==========================================================
-# FLOODWATCH WA – VERSION FINALE STABLE
-# ==========================================================
+# ============================================================================
+# FLOODWATCH WA – APPLICATION PROFESSIONNELLE INONDATIONS
+# Auteur : Version stable corrigée
+# ============================================================================
 
 import streamlit as st
 import geopandas as gpd
+import pandas as pd
+import numpy as np
 import folium
-from folium.plugins import Draw
-from streamlit_folium import st_folium
-import osmnx as ox
-from shapely.geometry import shape, mapping
 import ee
 import json
-import pandas as pd
-import plotly.express as px
-from datetime import datetime
+import requests
+from shapely.geometry import shape, mapping
+from streamlit_folium import st_folium
 
-# ==========================================================
-# CONFIG
-# ==========================================================
+# ============================================================================
+# CONFIG STREAMLIT
+# ============================================================================
 st.set_page_config(
-    page_title="FloodWatch WA Pro",
-    page_icon="🌊",
-    layout="wide"
+    page_title="FloodWatch WA – Inondations",
+    layout="wide",
+    page_icon="🌊"
 )
 
-# ==========================================================
-# INIT GEE (SERVICE ACCOUNT)
-# ==========================================================
-@st.cache_resource
+# ============================================================================
+# INITIALISATION GEE (STREAMLIT CLOUD SAFE)
+# ============================================================================
 def init_gee():
-    key = json.loads(st.secrets["GEE_SERVICE_ACCOUNT"])
-    credentials = ee.ServiceAccountCredentials(
-        key["client_email"],
-        key_data=json.dumps(key)
-    )
-    ee.Initialize(credentials)
-    return True
+    if not ee.data._initialized:
+        key = json.loads(st.secrets["gee_service_account"])
+        credentials = ee.ServiceAccountCredentials(
+            key["client_email"], key_data=key
+        )
+        ee.Initialize(credentials)
 
-GEE_OK = init_gee()
+init_gee()
 
-# ==========================================================
-# SESSION STATE
-# ==========================================================
-if "zone" not in st.session_state:
-    st.session_state.zone = None
+# ============================================================================
+# SIDEBAR – ZONE D'ÉTUDE
+# ============================================================================
+st.sidebar.title("🌍 Zone d’étude")
 
-if "results" not in st.session_state:
-    st.session_state.results = {
-        "pop_total": 0,
-        "pop_exp": 0,
-        "bld_total": 0,
-        "bld_imp": 0,
-        "rds_total": 0,
-        "rds_imp": 0,
-        "climate": pd.DataFrame(),
-        "flood_tiles": None,
-        "bld_gdf": gpd.GeoDataFrame(),
-        "rds_gdf": gpd.GeoDataFrame()
-    }
+uploaded = st.sidebar.file_uploader(
+    "Charger une zone (GeoJSON / SHP / KML)",
+    type=["geojson", "shp", "kml"]
+)
 
-# ==========================================================
-# GADM LOADER (ADMIN 0–4)
-# ==========================================================
-@st.cache_data
-def load_gadm(iso, level):
-    url = f"https://geodata.ucdavis.edu/gadm/gadm4.1/gpkg/gadm41_{iso}.gpkg"
-    return gpd.read_file(url, layer=f"ADM_ADM_{level}").to_crs(4326)
+draw_zone = st.sidebar.checkbox("✏️ Dessiner la zone manuellement")
 
-# ==========================================================
-# FLOOD DETECTION (SAR – CORRIGÉ)
-# ==========================================================
-def detect_flood(aoi, d0, d1, d2, d3):
-    s1 = ee.ImageCollection("COPERNICUS/S1_GRD") \
-        .filterBounds(aoi) \
-        .filter(ee.Filter.eq("instrumentMode", "IW")) \
-        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")) \
+# ============================================================================
+# LECTURE ZONE
+# ============================================================================
+def load_zone(file):
+    gdf = gpd.read_file(file)
+    return gdf.to_crs(4326)
+
+aoi_gdf = None
+
+if uploaded:
+    aoi_gdf = load_zone(uploaded)
+
+# ============================================================================
+# CARTE DE DESSIN
+# ============================================================================
+if draw_zone and not aoi_gdf:
+    st.info("Dessine la zone puis valide")
+    m = folium.Map(location=[14.5, -14.5], zoom_start=7)
+    folium.plugins.Draw(export=True).add_to(m)
+    output = st_folium(m, height=500)
+
+    if output and output.get("last_active_drawing"):
+        geom = shape(output["last_active_drawing"]["geometry"])
+        aoi_gdf = gpd.GeoDataFrame(geometry=[geom], crs=4326)
+
+# ============================================================================
+# STOP SI PAS DE ZONE
+# ============================================================================
+if aoi_gdf is None:
+    st.stop()
+
+aoi = ee.Geometry(mapping(aoi_gdf.geometry.iloc[0]))
+
+# ============================================================================
+# SENTINEL-1 – DÉTECTION INONDATION (ROBUSTE)
+# ============================================================================
+def detect_flood(aoi, d1, d2, d3, d4):
+    s1 = (
+        ee.ImageCollection("COPERNICUS/S1_GRD")
+        .filterBounds(aoi)
+        .filter(ee.Filter.eq("instrumentMode", "IW"))
+        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
         .select("VV")
-
-    ref = s1.filterDate(d0, d1).median()
-    flood = s1.filterDate(d2, d3).reduce(ee.Reducer.percentile([10]))
-
-    diff = ee.Image(10).multiply(ref.log10()) \
-        .subtract(ee.Image(10).multiply(flood.log10()))
-
-    water = diff.gt(1.25)
-
-    slope = ee.Terrain.slope(ee.Image("USGS/SRTMGL1_003"))
-    water = water.updateMask(slope.lt(5))
-
-    return water.selfMask().clip(aoi)
-
-# ==========================================================
-# POPULATION WORLDPOP
-# ==========================================================
-def population_stats(aoi, flood_mask):
-    pop = ee.ImageCollection("WorldPop/GP/100m/pop") \
-        .filterDate("2020-01-01", "2021-01-01") \
-        .mosaic() \
-        .select("population") \
-        .clip(aoi)
-
-    total = pop.reduceRegion(
-        ee.Reducer.sum(), aoi, 100, maxPixels=1e9
-    ).get("population").getInfo() or 0
-
-    exposed = pop.updateMask(flood_mask).reduceRegion(
-        ee.Reducer.sum(), aoi, 100, maxPixels=1e9
-    ).get("population").getInfo() or 0
-
-    return int(total), int(exposed)
-
-# ==========================================================
-# CLIMAT CHIRPS
-# ==========================================================
-def climate_stats(aoi, start, end):
-    rain = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY") \
-        .filterBounds(aoi) \
-        .filterDate(start, end)
-
-    def f(img):
-        return ee.Feature(None, {
-            "date": img.date().format("YYYY-MM-dd"),
-            "rain": img.reduceRegion(
-                ee.Reducer.mean(), aoi, 5000
-            ).get("precipitation")
-        })
-
-    data = rain.map(f).getInfo()
-    df = pd.DataFrame([d["properties"] for d in data])
-    df["date"] = pd.to_datetime(df["date"])
-    return df
-
-# ==========================================================
-# OSM – IMPACT INFRASTRUCTURES
-# ==========================================================
-def osm_assets(zone, flood_mask):
-    poly = zone.unary_union
-
-    bld = ox.features_from_polygon(poly, tags={"building": True})
-    rds = ox.features_from_polygon(poly, tags={"highway": True})
-
-    bld = bld[bld.geometry.type.isin(["Polygon", "MultiPolygon"])]
-    rds = rds[rds.geometry.type.isin(["LineString", "MultiLineString"])]
-
-    def impact(gdf):
-        pts = ee.FeatureCollection([
-            ee.Feature(ee.Geometry.Point(g.centroid.x, g.centroid.y))
-            for g in gdf.geometry
-        ])
-        vals = flood_mask.sampleRegions(pts, scale=10) \
-            .aggregate_array("flood").getInfo()
-        gdf["impacted"] = [v == 1 for v in vals]
-        return gdf
-
-    return impact(bld), impact(rds)
-
-# ==========================================================
-# SIDEBAR – ZONE D’ÉTUDE
-# ==========================================================
-with st.sidebar:
-    st.header("🗺️ Zone d’étude")
-
-    mode = st.radio("Méthode", ["GADM", "Upload", "Dessin"])
-
-    if mode == "GADM":
-        country = st.selectbox("Pays", ["SEN", "MLI", "NER", "BFA"])
-        level = st.slider("Niveau admin", 0, 4, 2)
-        gadm = load_gadm(country, level)
-
-        col = f"NAME_{level}" if level > 0 else "COUNTRY"
-        units = st.multiselect("Unités", gadm[col].unique())
-        if units:
-            st.session_state.zone = gadm[gadm[col].isin(units)]
-
-    elif mode == "Upload":
-        f = st.file_uploader("GeoJSON / SHP / KML", type=["geojson", "json", "shp", "kml"])
-        if f:
-            st.session_state.zone = gpd.read_file(f).to_crs(4326)
-
-    elif mode == "Dessin":
-        m0 = folium.Map(location=[14.5, -14.5], zoom_start=6)
-        Draw().add_to(m0)
-        res = st_folium(m0, height=300)
-        if res and res.get("last_active_drawing"):
-            geom = shape(res["last_active_drawing"]["geometry"])
-            st.session_state.zone = gpd.GeoDataFrame(geometry=[geom], crs=4326)
-
-    st.subheader("📅 Dates")
-    ref = st.date_input("Période sèche", [datetime(2023,1,1), datetime(2023,4,30)])
-    flood = st.date_input("Période inondation", [datetime(2024,8,1), datetime(2024,10,30)])
-
-# ==========================================================
-# ANALYSE
-# ==========================================================
-if st.session_state.zone is not None and GEE_OK:
-    zone = st.session_state.zone
-    aoi = ee.Geometry(mapping(zone.unary_union))
-
-    flood_mask = detect_flood(
-        aoi, str(ref[0]), str(ref[1]), str(flood[0]), str(flood[1])
     )
 
-    pop_total, pop_exp = population_stats(aoi, flood_mask)
-    climate = climate_stats(aoi, str(flood[0]), str(flood[1]))
-    bld, rds = osm_assets(zone, flood_mask)
+    ref = s1.filterDate(d1, d2).median()
+    flood = s1.filterDate(d3, d4).median()
 
-    st.session_state.results = {
-        "pop_total": pop_total,
-        "pop_exp": pop_exp,
-        "bld_total": len(bld),
-        "bld_imp": int(bld.impacted.sum()),
-        "rds_total": len(rds),
-        "rds_imp": int(rds.impacted.sum()),
-        "climate": climate,
-        "flood_tiles": flood_mask.getMapId({"palette": ["0000ff"]}),
-        "bld_gdf": bld,
-        "rds_gdf": rds
-    }
+    diff = flood.subtract(ref)
+    flood_mask = diff.lt(-1.25)
 
-# ==========================================================
-# DASHBOARD
-# ==========================================================
-res = st.session_state.results
-st.title("🌊 FloodWatch WA – Résultats")
+    return flood_mask.selfMask()
+
+# ============================================================================
+# POPULATION – WORLDPOP (RÉEL)
+# ============================================================================
+def population_total(aoi):
+    pop = ee.ImageCollection("WorldPop/GP/100m/pop").median()
+    stats = pop.reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=aoi,
+        scale=100,
+        maxPixels=1e13
+    )
+    return int(stats.get("population").getInfo() or 0)
+
+# ============================================================================
+# BÂTIMENTS & ROUTES – OSM VIA OVERPASS
+# ============================================================================
+def osm_query(aoi, key):
+    geom = aoi_gdf.geometry.iloc[0]
+    minx, miny, maxx, maxy = geom.bounds
+
+    query = f"""
+    [out:json];
+    (
+      way["{key}"]({miny},{minx},{maxy},{maxx});
+    );
+    out geom;
+    """
+
+    r = requests.post(
+        "https://overpass-api.de/api/interpreter",
+        data=query
+    )
+    data = r.json()["elements"]
+
+    geoms = []
+    for el in data:
+        if "geometry" in el:
+            coords = [(p["lon"], p["lat"]) for p in el["geometry"]]
+            geoms.append(shape({"type": "LineString", "coordinates": coords}))
+
+    return gpd.GeoDataFrame(geometry=geoms, crs=4326)
+
+buildings_gdf = osm_query(aoi, "building")
+roads_gdf = osm_query(aoi, "highway")
+
+# ============================================================================
+# IMPACT INONDATION SUR OSM
+# ============================================================================
+flood_img = detect_flood(aoi, "2024-07-01", "2024-07-15", "2024-08-01", "2024-08-15")
+
+def impacted(gdf):
+    impacted = []
+    for geom in gdf.geometry:
+        pts = ee.Feature(ee.Geometry(mapping(geom)))
+        val = flood_img.reduceRegion(
+            ee.Reducer.anyNonZero(),
+            pts.geometry(),
+            scale=10,
+            maxPixels=1e8
+        ).values().get(0).getInfo()
+        impacted.append(bool(val))
+    gdf["impacted"] = impacted
+    return gdf
+
+buildings_gdf = impacted(buildings_gdf)
+roads_gdf = impacted(roads_gdf)
+
+# ============================================================================
+# CLIMAT – NASA POWER (CORRIGÉ)
+# ============================================================================
+def climate(aoi, start, end):
+    c = aoi.centroid().getInfo()["coordinates"]
+    url = (
+        "https://power.larc.nasa.gov/api/temporal/daily/point?"
+        f"latitude={c[1]}&longitude={c[0]}"
+        f"&start={start.replace('-', '')}"
+        f"&end={end.replace('-', '')}"
+        "&parameters=PRECTOTCORR,T2M"
+        "&community=AG&format=JSON"
+    )
+    data = requests.get(url).json()["properties"]["parameter"]
+    rain = sum(data["PRECTOTCORR"].values())
+    temp = np.mean(list(data["T2M"].values()))
+    return rain, temp
+
+rain, temp = climate(aoi, "2024-08-01", "2024-08-15")
+
+# ============================================================================
+# INDICATEURS
+# ============================================================================
+st.title("🌊 FloodWatch WA – Analyse d’impact")
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Population totale", f"{res['pop_total']:,}")
-c2.metric("Population impactée", f"{res['pop_exp']:,}")
-c3.metric("Bâtiments impactés", res["bld_imp"])
-c4.metric("Routes impactées", res["rds_imp"])
 
-# ==========================================================
-# MAP
-# ==========================================================
-m = folium.Map(location=[14.5, -14.5], zoom_start=6)
+c1.metric("Population totale", f"{population_total(aoi):,}")
+c2.metric("Bâtiments", len(buildings_gdf))
+c3.metric("Bâtiments impactés", buildings_gdf.impacted.sum())
+c4.metric("Routes impactées", roads_gdf.impacted.sum())
 
-if res["flood_tiles"]:
-    folium.TileLayer(
-        tiles=res["flood_tiles"]["tile_fetcher"].url_format,
-        attr="GEE",
-        name="Inondation"
-    ).add_to(m)
+st.metric("🌧️ Pluie cumulée (mm)", f"{rain:.1f}")
+st.metric("🌡️ Température moyenne (°C)", f"{temp:.1f}")
 
-if not res["bld_gdf"].empty:
-    folium.GeoJson(
-        res["bld_gdf"][res["bld_gdf"].impacted],
-        style_function=lambda x: {"color": "red", "fillColor": "red"},
-        name="Bâtiments impactés"
-    ).add_to(m)
+# ============================================================================
+# CARTE
+# ============================================================================
+m = folium.Map(location=[14.5, -14.5], zoom_start=8)
 
-if not res["rds_gdf"].empty:
-    folium.GeoJson(
-        res["rds_gdf"][res["rds_gdf"].impacted],
-        style_function=lambda x: {"color": "red"},
-        name="Routes impactées"
-    ).add_to(m)
+folium.GeoJson(
+    buildings_gdf[buildings_gdf.impacted],
+    style_function=lambda _: {"color": "red"}
+).add_to(m)
 
-folium.LayerControl().add_to(m)
-st_folium(m, height=600, use_container_width=True)
+folium.GeoJson(
+    roads_gdf[roads_gdf.impacted],
+    style_function=lambda _: {"color": "red"}
+).add_to(m)
 
-# ==========================================================
-# CLIMAT
-# ==========================================================
-if not res["climate"].empty:
-    st.subheader("🌧️ Pluviométrie")
-    st.plotly_chart(
-        px.bar(res["climate"], x="date", y="rain"),
-        use_container_width=True
-    )
+st_folium(m, height=600)
