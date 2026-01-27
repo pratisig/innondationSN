@@ -1,6 +1,6 @@
 # ============================================================
-# FLOOD ANALYSIS & EMERGENCY PLANNING APP - CORRECTED
-# West Africa – Sentinel-1 / CHIRPS / WorldPop / OSM / Manual Regions
+# FLOOD ANALYSIS & EMERGENCY PLANNING APP - FIXED S1
+# West Africa – Sentinel-1 (Assouplissements) / CHIRPS / WorldPop / OSM
 # ============================================================
 
 import streamlit as st
@@ -32,7 +32,7 @@ st.set_page_config(
     page_icon="🌊"
 )
 st.title("🌊 Analyse d'Impact Inondations & Planification d'Urgence")
-st.caption("Sentinel-1 | CHIRPS | WorldPop | OSMnx (Admin 1-3)")
+st.caption("Sentinel-1 (VV+VH) | CHIRPS | WorldPop | OSMnx")
 
 
 # ============================================================
@@ -178,7 +178,6 @@ def safe_sum(df, col):
 def create_circular_region(lat, lon, buffer_km):
     """Crée une région circulaire autour d'un point."""
     point = Point(lon, lat)
-    # Approximation : 1° ≈ 111 km
     buffer_degrees = buffer_km / 111.0
     circle = point.buffer(buffer_degrees)
     return circle
@@ -245,67 +244,92 @@ st.sidebar.success(f"✅ {len(sel_regions)} région(s) sélectionnée(s)")
 st.sidebar.header("2️⃣ Analyse Temporelle")
 
 st.sidebar.subheader("📅 Période de Référence (Sèche)")
-ref_start = st.sidebar.date_input("Début référence", pd.to_datetime("2024-01-01"))
-ref_end = st.sidebar.date_input("Fin référence", pd.to_datetime("2024-03-31"))
+ref_start = st.sidebar.date_input("Début référence", pd.to_datetime("2023-01-01"))
+ref_end = st.sidebar.date_input("Fin référence", pd.to_datetime("2023-03-31"))
 
 st.sidebar.subheader("🌊 Période Crise (Inondation)")
-start_date = st.sidebar.date_input("Début crise", pd.to_datetime("2024-07-01"))
-end_date = st.sidebar.date_input("Fin crise", pd.to_datetime("2024-10-31"))
+start_date = st.sidebar.date_input("Début crise", pd.to_datetime("2023-08-01"))
+end_date = st.sidebar.date_input("Fin crise", pd.to_datetime("2023-10-31"))
 
-analysis_mode = st.sidebar.radio("Mode", ["Synthèse Globale"])
+st.sidebar.info("💡 Utilise 2023 pour avoir plus de données Sentinel-1 disponibles.")
 
 
 # ============================================================
-# CORE ENGINES - FLOOD DETECTION
+# CORE ENGINES - FLOOD DETECTION (ASSOUPLISSEMENTS)
 # ============================================================
 @st.cache_data
 def get_flood_detection(aoi_json, ref_start_str, ref_end_str, flood_start_str, flood_end_str):
     """
     Détection inondation Sentinel-1 VV avec référence.
-    Compare backscatter période sèche vs crise.
+    ASSOUPLISSEMENTS : accepte VV+VH, toutes les passes orbitales.
     """
     aoi = ee.Geometry(aoi_json)
     
-    # Collection Sentinel-1
+    st.write(f"🔍 **Recherche Sentinel-1** pour {flood_start_str} → {flood_end_str}")
+    
+    # ✅ ASSOUPLISSEMENT 1 : Accepter VV ET VH
     s1 = (ee.ImageCollection("COPERNICUS/S1_GRD")
           .filterBounds(aoi)
-          .filter(ee.Filter.eq("instrumentMode", "IW"))
-          .filter(ee.Filter.eq("orbitProperties_pass", "DESCENDING"))
-          .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
-          .filter(ee.Filter.eq("resolution_meters", 10))
-          .select("VV"))
+          .filterDate(flood_start_str, flood_end_str)
+          .filter(ee.Filter.eq("instrumentMode", "IW")))
     
-    # Évaluer le count
-    s1_count = safe_get_info(s1.size())
-    if s1_count is None or s1_count < 1:
+    # Évaluer le count - SANS filtrer par pass ou polarisation d'abord
+    s1_count_all = safe_get_info(s1.size())
+    st.write(f"   → Images S1 trouvées (tous types) : {s1_count_all}")
+    
+    if s1_count_all is None or s1_count_all < 1:
+        st.error(f"❌ Aucune donnée Sentinel-1 pour cette période/région.")
         return None, None, 0
     
-    # Image de référence (sèche)
-    ref_img = s1.filterDate(ref_start_str, ref_end_str).median()
+    # ✅ ASSOUPLISSEMENT 2 : Sélectionner VV si disponible, sinon VH
+    s1_vv = s1.filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+    s1_vv_count = safe_get_info(s1_vv.size())
     
-    # Image crise
-    crisis_img = s1.filterDate(flood_start_str, flood_end_str).median()
+    if s1_vv_count and s1_vv_count > 0:
+        st.write(f"   → Images VV trouvées : {s1_vv_count}")
+        s1_selected = s1_vv.select("VV")
+    else:
+        st.write("   ⚠️ Pas de VV, utilisation de VH...")
+        s1_selected = s1.filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH")).select("VH")
+        s1_count_all = safe_get_info(s1_selected.size())
+        if not s1_count_all or s1_count_all < 1:
+            st.error("❌ Aucune polarisation (VV/VH) disponible.")
+            return None, None, 0
+    
+    # Image de référence (sèche)
+    ref_s1 = (ee.ImageCollection("COPERNICUS/S1_GRD")
+              .filterBounds(aoi)
+              .filterDate(ref_start_str, ref_end_str)
+              .filter(ee.Filter.eq("instrumentMode", "IW")))
+    
+    # Sélectionner même polarisation pour référence
+    if s1_vv_count and s1_vv_count > 0:
+        ref_img = ref_s1.filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")).select("VV").median()
+    else:
+        ref_img = ref_s1.filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH")).select("VH").median()
+    
+    crisis_img = s1_selected.median()
     
     # Vérifier que les images ont des données
     ref_has_data = safe_get_info(ref_img.hasData())
     crisis_has_data = safe_get_info(crisis_img.hasData())
     
     if not ref_has_data or not crisis_has_data:
-        return None, None, s1_count
+        st.error(f"❌ Données vides : ref={ref_has_data}, crisis={crisis_has_data}")
+        return None, None, s1_count_all
     
-    # Conversion en dB - PROTÉGÉ contre division par zéro
+    # Conversion en dB
     def to_db(img):
-        # Clamp entre -30 et 0 dB
         clamped = img.max(ee.Image(-30))
         return ee.Image(10).multiply(clamped.log10())
     
     ref_db = to_db(ref_img)
     crisis_db = to_db(crisis_img)
     
-    # Différence de backscatter (eau = réduction du signal)
+    # Différence de backscatter
     diff = ref_db.subtract(crisis_db)
     
-    # Seuil inondation
+    # Seuil inondation (eau = backscatter diminué)
     flooded_raw = diff.gt(1.25)
     
     # Masque pente
@@ -314,7 +338,7 @@ def get_flood_detection(aoi_json, ref_start_str, ref_end_str, flood_start_str, f
         slope = ee.Algorithms.Terrain(dem).select("slope")
         mask_slope = slope.lt(5)
     except:
-        mask_slope = ee.Image(1)  # Fallback : pas de masque pente
+        mask_slope = ee.Image(1)
     
     # Masque eau permanente
     try:
@@ -322,7 +346,7 @@ def get_flood_detection(aoi_json, ref_start_str, ref_end_str, flood_start_str, f
         permanent_water = gsw.select("occurrence").gte(90)
         mask_perm = permanent_water.Not()
     except:
-        mask_perm = ee.Image(1)  # Fallback : pas de masque eau perm
+        mask_perm = ee.Image(1)
     
     # Application des masques
     flooded = (flooded_raw
@@ -340,7 +364,7 @@ def get_flood_detection(aoi_json, ref_start_str, ref_end_str, flood_start_str, f
             .sum()
             .rename('precip'))
     
-    return flooded, rain, s1_count
+    return flooded, rain, s1_count_all
 
 
 # ============================================================
@@ -349,12 +373,8 @@ def get_flood_detection(aoi_json, ref_start_str, ref_end_str, flood_start_str, f
 def analyze_infrastructure_impact_osmnx(admin_polygon):
     """Analyse impacts infrastructures via OSMnx."""
     try:
-        # Utiliser features_from_polygon (nouvelle API osmnx)
-        tags = {
-            "building": True,
-        }
-        
-        buildings_gdf = ox.features_from_polygon(admin_polygon, tags)
+        # Utiliser features_from_polygon
+        buildings_gdf = ox.features_from_polygon(admin_polygon, {"building": True})
         buildings_count = len(buildings_gdf) if not buildings_gdf.empty else 0
         
         # Routes
@@ -395,6 +415,13 @@ def analyze_infrastructure_impact_osmnx(admin_polygon):
 st.subheader("🗺️ Analyse d'Impact Spatiale")
 
 with st.spinner("Analyse GEE & OSMnx en cours..."):
+    
+    # ✅ Afficher progression
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    status_text.text("1/3 - Détection inondations (Sentinel-1)...")
+    
     # Obtenir mask d'inondation
     flood_all, rain_all, s1_count = get_flood_detection(
         geom_ee.getInfo(),
@@ -404,9 +431,14 @@ with st.spinner("Analyse GEE & OSMnx en cours..."):
         str(end_date)
     )
     
+    progress_bar.progress(33)
+    
     if flood_all is None or s1_count < 1:
-        st.error(f"❌ Pas de données Sentinel-1 ou images vides (count={s1_count}).")
+        st.error(f"❌ Impossible de continuer (S1 count={s1_count}).")
+        st.info("💡 **Suggestions:**\n- Élargir la plage temporelle\n- Changer de région\n- Utiliser 2023 au lieu de 2024")
         st.stop()
+    
+    status_text.text("2/3 - Population & analyse spatiale...")
     
     # Population WorldPop
     pop_img = (ee.ImageCollection("WorldPop/GP/100m/pop")
@@ -428,7 +460,6 @@ with st.spinner("Analyse GEE & OSMnx en cours..."):
         
         # Stats GEE
         try:
-            # Protéger contre images vides
             flood_area_img = flood_all.multiply(ee.Image.pixelArea()).rename('f_area')
             pop_masked = pop_img.updateMask(flood_all.select(0)).rename('p_exp')
             
@@ -463,6 +494,8 @@ with st.spinner("Analyse GEE & OSMnx en cours..."):
         })
     
     df_res = pd.DataFrame(features_list)
+    progress_bar.progress(66)
+    status_text.text("3/3 - Cartographie...")
 
 
 # ─────────────────────────────────────────────────────────
@@ -475,9 +508,8 @@ try:
         tiles="CartoDB positron"
     )
     
-    # Overlay flood map - PROTÉGÉ
+    # Overlay flood map
     try:
-        # Vérifier que flood_all a des données
         flood_has_data = safe_get_info(flood_all.hasData())
         
         if flood_has_data:
@@ -522,6 +554,9 @@ try:
 
 except Exception as e:
     st.error(f"❌ Carte : {e}")
+
+progress_bar.progress(100)
+status_text.text("✅ Analyse terminée!")
 
 
 # ─────────────────────────────────────────────────────────
@@ -580,4 +615,9 @@ st.sidebar.markdown(f"""
 - **Période crise**: {start_date} → {end_date}  
 - **Images S1**: {s1_count}  
 - **Précipitations moyennes**: {total_rain:.1f} mm  
+
+### 🔧 Assouplissements appliqués
+- ✅ Accepte polarisations VV et VH
+- ✅ Toutes les passes orbitales (ASCENDING/DESCENDING)
+- ✅ Mode IW seulement (10m résolution)
 """)
