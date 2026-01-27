@@ -13,6 +13,7 @@ from streamlit_folium import st_folium
 
 import osmnx as ox
 import ee
+import requests
 
 # ═════════════════════════════════════════════════════════════════
 # 1. CONFIG & INIT
@@ -125,28 +126,34 @@ def get_population_stats(aoi_ee, flood_mask):
         return int(total_pop), int(exposed_pop)
     except: return 0,0
 
-def get_osm_buildings_stable(selected_zone):
+# Chargement OSM + fallback OpenBuildings
+def get_buildings(selected_zone):
     if selected_zone is None or selected_zone.empty:
         return gpd.GeoDataFrame()
+    poly = selected_zone.unary_union.convex_hull.simplify(0.001)
+    # 1. OSM
     try:
-        poly = selected_zone.unary_union.convex_hull.simplify(0.001)
-        building_tags = {"building": True}
-        amenity_tags = {"amenity": ["hospital","school","clinic","marketplace","place_of_worship"]}
-        try:
-            df_building = ox.geometries_from_polygon(poly, tags=building_tags)
-        except: df_building = gpd.GeoDataFrame()
-        try:
-            df_amenity = ox.geometries_from_polygon(poly, tags=amenity_tags)
-        except: df_amenity = gpd.GeoDataFrame()
-        df = pd.concat([df_building, df_amenity], ignore_index=True)
-        if df.empty:
-            bounds = selected_zone.total_bounds
-            north, south, east, west = bounds[3], bounds[1], bounds[2], bounds[0]
-            df = ox.features_from_bbox(north, south, east, west, tags={**building_tags, **amenity_tags})
-        df = df[df.geometry.type.isin(["Polygon","MultiPolygon"])]
-        df = df.clip(selected_zone).reset_index(drop=True)
-        return df
-    except: return gpd.GeoDataFrame()
+        osm_tags = {"building": True, "amenity":["hospital","school","clinic","marketplace","place_of_worship"]}
+        df_osm = ox.geometries_from_polygon(poly, tags=osm_tags)
+        df_osm = df_osm[df_osm.geometry.type.isin(["Polygon","MultiPolygon"])]
+        df_osm = df_osm.clip(selected_zone).reset_index(drop=True)
+        if not df_osm.empty:
+            return df_osm
+    except: df_osm = gpd.GeoDataFrame()
+
+    # 2. Fallback OpenBuildings
+    try:
+        bounds = selected_zone.total_bounds
+        minx,miny,maxx,maxy = bounds[0],bounds[1],bounds[2],bounds[3]
+        url = f"https://storage.googleapis.com/openbuildings/v3/vector/geojson?bbox={minx},{miny},{maxx},{maxy}"
+        r = requests.get(url, timeout=60)
+        if r.status_code==200:
+            j = r.json()
+            gdf = gpd.GeoDataFrame.from_features(j['features'], crs="EPSG:4326")
+            return gdf.clip(selected_zone).reset_index(drop=True)
+    except: pass
+
+    return gpd.GeoDataFrame()
 
 # ═════════════════════════════════════════════════════════════════
 # 3. UI SIDEBAR
@@ -190,7 +197,7 @@ if st.button("🚀 LANCER L'ANALYSE", type="primary"):
         full_aoi_ee = ee.Geometry(mapping(selected_zone.unary_union))
         st.session_state.flood_mask = get_flood_mask(full_aoi_ee,"2023-01-01","2023-05-01",str(start_f),str(end_f),flood_threshold)
         st.session_state.precip = get_precip_cumul(full_aoi_ee,str(start_f),str(end_f))
-        buildings_gdf = get_osm_buildings_stable(selected_zone)
+        buildings_gdf = get_buildings(selected_zone)
         
         # Intersection bâtiments impactés
         if st.session_state.flood_mask and not buildings_gdf.empty:
