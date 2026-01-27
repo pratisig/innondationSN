@@ -1,69 +1,28 @@
-import os
-import io
-import json
-from datetime import datetime
-
 import streamlit as st
-import pandas as pd
 import geopandas as gpd
-from shapely.geometry import mapping
-
 import folium
 from streamlit_folium import st_folium
-
 import osmnx as ox
-import ee
-import requests
+from shapely.geometry import mapping
 
 # ═════════════════════════════════════════════════════════════════
-# 1. CONFIG & INIT
+# 1. CONFIGURATION & STYLE
 # ═════════════════════════════════════════════════════════════════
-st.set_page_config(page_title="Flood Analysis WA", layout="wide")
+st.set_page_config(page_title="Visualiseur OSM", layout="wide")
 
-ox.settings.timeout = 120
+# Paramètres OSMnx pour la performance
+ox.settings.timeout = 180
 ox.settings.use_cache = True
 
-# Initialisation variables état
-if 'analysis_done' not in st.session_state:
-    st.session_state.analysis_done = False
-if 'flood_mask' not in st.session_state:
-    st.session_state.flood_mask = None
-if 'impacted_infra' not in st.session_state:
-    st.session_state.impacted_infra = gpd.GeoDataFrame()
-if 'results_gdf' not in st.session_state:
-    st.session_state.results_gdf = gpd.GeoDataFrame()
-if 'precip' not in st.session_state:
-    st.session_state.precip = 0.0
-if 'stats' not in st.session_state:
-    st.session_state.stats = {
-        "pop_exposed": 0,
-        "total_pop": 0,
-        "total_flood_ha": 0,
-        "total_infra": 0
-    }
-
-# ────────── INITIALISATION GEE ──────────
-@st.cache_resource
-def init_gee():
-    try:
-        if "GEE_SERVICE_ACCOUNT" in st.secrets:
-            key_dict = st.secrets["GEE_SERVICE_ACCOUNT"]
-            if isinstance(key_dict, str):
-                key_dict = json.loads(key_dict)
-            credentials = ee.ServiceAccountCredentials(
-                key_dict["client_email"], key_data=json.dumps(key_dict)
-            )
-            ee.Initialize(credentials)
-            return True
-        ee.Initialize()
-        return True
-    except Exception:
-        return False
-
-gee_available = init_gee()
+st.markdown("""
+    <style>
+    .main { background-color: #f5f7f9; }
+    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    </style>
+    """, unsafe_allow_html=True)
 
 # ═════════════════════════════════════════════════════════════════
-# 2. FONCTIONS UTILITAIRES
+# 2. CHARGEMENT DES DONNÉES ADMINISTRATIVES
 # ═════════════════════════════════════════════════════════════════
 
 @st.cache_data(show_spinner=False)
@@ -73,216 +32,150 @@ def load_gadm(iso, level):
         gdf = gpd.read_file(url, layer=level)
         return gdf.to_crs(epsg=4326)
     except Exception as e:
-        st.error(f"Erreur GADM: {e}")
+        st.error(f"Erreur lors du chargement des limites GADM : {e}")
         return None
 
-def get_flood_mask(aoi_ee, start_ref, end_ref, start_flood, end_flood, threshold=5):
-    if not gee_available: return None
+@st.cache_data(show_spinner=False)
+def get_osm_data(_gdf_aoi):
+    """Récupère les bâtiments et les routes depuis OSM via OSMnx"""
+    if _gdf_aoi is None or _gdf_aoi.empty:
+        return None, None
+    
     try:
-        s1 = (ee.ImageCollection("COPERNICUS/S1_GRD")
-              .filterBounds(aoi_ee)
-              .filter(ee.Filter.eq("instrumentMode", "IW"))
-              .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
-              .select('VV'))
-        img_ref = s1.filterDate(start_ref, end_ref).median().clip(aoi_ee)
-        img_flood = s1.filterDate(start_flood, end_flood).min().clip(aoi_ee)
-        diff = img_ref.subtract(img_flood)
-        return diff.gt(threshold).rename('flood').selfMask()
-    except Exception: return None
-
-def get_precip_cumul(aoi_ee, start_date, end_date):
-    if not gee_available: return 0
-    try:
-        chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY") \
-                   .filterBounds(aoi_ee) \
-                   .filterDate(start_date, end_date) \
-                   .select('precipitation') \
-                   .sum()
-        stats = chirps.reduceRegion(reducer=ee.Reducer.mean(), geometry=aoi_ee, scale=5000)
-        return float(stats.get('precipitation').getInfo() or 0)
-    except: return 0
-
-def get_area_stats(aoi_ee, flood_mask):
-    if not gee_available or flood_mask is None: return 0
-    try:
-        area_img = flood_mask.multiply(ee.Image.pixelArea())
-        stats = area_img.reduceRegion(reducer=ee.Reducer.sum(), geometry=aoi_ee, scale=30, maxPixels=1e9)
-        area_m2 = stats.get('flood').getInfo() or 0
-        return area_m2 / 10000
-    except: return 0
-
-def get_population_stats(aoi_ee, flood_mask):
-    if not gee_available: return 0,0
-    try:
-        pop_dataset = ee.ImageCollection("WorldPop/GP/100m/pop") \
-                        .filterDate('2020-01-01','2021-01-01') \
-                        .mosaic().clip(aoi_ee)
-        stats_total = pop_dataset.reduceRegion(ee.Reducer.sum(), geometry=aoi_ee, scale=100, maxPixels=1e9)
-        total_pop = stats_total.get('population').getInfo() or 0
-        exposed_pop = 0
-        if flood_mask:
-            stats_exposed = pop_dataset.updateMask(flood_mask).reduceRegion(ee.Reducer.sum(), geometry=aoi_ee, scale=100, maxPixels=1e9)
-            exposed_pop = stats_exposed.get('population').getInfo() or 0
-        return int(total_pop), int(exposed_pop)
-    except: return 0,0
-
-# Chargement OSM + fallback OpenBuildings
-def get_buildings(selected_zone):
-    if selected_zone is None or selected_zone.empty:
-        return gpd.GeoDataFrame()
-    poly = selected_zone.unary_union.convex_hull.simplify(0.001)
-    # 1. OSM
-    try:
-        osm_tags = {"building": True, "amenity":["hospital","school","clinic","marketplace","place_of_worship"]}
-        df_osm = ox.geometries_from_polygon(poly, tags=osm_tags)
-        df_osm = df_osm[df_osm.geometry.type.isin(["Polygon","MultiPolygon"])]
-        df_osm = df_osm.clip(selected_zone).reset_index(drop=True)
-        if not df_osm.empty:
-            return df_osm
-    except: df_osm = gpd.GeoDataFrame()
-
-    # 2. Fallback OpenBuildings
-    try:
-        bounds = selected_zone.total_bounds
-        minx,miny,maxx,maxy = bounds[0],bounds[1],bounds[2],bounds[3]
-        url = f"https://storage.googleapis.com/openbuildings/v3/vector/geojson?bbox={minx},{miny},{maxx},{maxy}"
-        r = requests.get(url, timeout=60)
-        if r.status_code==200:
-            j = r.json()
-            gdf = gpd.GeoDataFrame.from_features(j['features'], crs="EPSG:4326")
-            return gdf.clip(selected_zone).reset_index(drop=True)
-    except: pass
-
-    return gpd.GeoDataFrame()
+        # Création du polygone de recherche
+        poly = _gdf_aoi.unary_union
+        
+        # 1. Récupération des routes
+        graph = ox.graph_from_polygon(poly, network_type='all', simplify=True)
+        gdf_routes = ox.graph_to_gdfs(graph, nodes=False, edges=True)
+        
+        # 2. Récupération des bâtiments et équipements
+        tags = {
+            'building': True, 
+            'amenity': True,
+            'healthcare': True,
+            'education': True
+        }
+        gdf_buildings = ox.geometries_from_polygon(poly, tags=tags)
+        
+        # Nettoyage des données
+        if not gdf_buildings.empty:
+            gdf_buildings = gdf_buildings[gdf_buildings.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+            gdf_buildings = gdf_buildings.clip(_gdf_aoi).reset_index(drop=True)
+            
+        if not gdf_routes.empty:
+            gdf_routes = gdf_routes.clip(_gdf_aoi).reset_index(drop=True)
+            
+        return gdf_buildings, gdf_routes
+    except Exception as e:
+        st.warning(f"Note : Certaines données OSM n'ont pas pu être récupérées pour cette zone ({e})")
+        return gpd.GeoDataFrame(), gpd.GeoDataFrame()
 
 # ═════════════════════════════════════════════════════════════════
-# 3. UI SIDEBAR
+# 3. INTERFACE UTILISATEUR (SIDEBAR)
 # ═════════════════════════════════════════════════════════════════
-st.sidebar.header("🌍 Paramètres")
 
-country_dict = {"Sénégal":"SEN","Mali":"MLI","Niger":"NER","Burkina Faso":"BFA"}
-source_option = st.sidebar.radio("Source de la zone", ["Pays/Admin","Fichier"])
+st.sidebar.header("🗺️ Configuration")
+
+country_dict = {"Sénégal": "SEN", "Mali": "MLI", "Niger": "NER", "Burkina Faso": "BFA"}
+country = st.sidebar.selectbox("Sélectionner un Pays", list(country_dict.keys()))
+iso = country_dict[country]
+
+level = st.sidebar.slider("Niveau Administratif (GADM)", 0, 3, 2)
+gdf_base = load_gadm(iso, level)
 
 selected_zone = None
-
-if source_option=="Pays/Admin":
-    country = st.sidebar.selectbox("Pays", list(country_dict.keys()))
-    iso = country_dict[country]
-    level = st.sidebar.slider("Niveau Administratif", 0, 3, 2)
-    gdf_base = load_gadm(iso, level)
-    if gdf_base is not None:
-        col_name = f"NAME_{level}" if level>0 else "COUNTRY"
-        names = sorted(gdf_base[col_name].astype(str).unique())
-        choice = st.sidebar.multiselect("Zone(s)", names)
-        selected_zone = gdf_base[gdf_base[col_name].isin(choice)].copy() if choice else gdf_base.iloc[[0]].copy()
-elif source_option=="Fichier":
-    uploaded_file = st.sidebar.file_uploader("Importer KML/GeoJSON", type=["kml","geojson","shp"])
-    if uploaded_file:
-        selected_zone = gpd.read_file(uploaded_file).to_crs(epsg=4326)
+if gdf_base is not None:
+    col_name = f"NAME_{level}" if level > 0 else "COUNTRY"
+    names = sorted(gdf_base[col_name].astype(str).unique())
+    choice = st.sidebar.selectbox("Choisir la Zone", names)
+    selected_zone = gdf_base[gdf_base[col_name] == choice].copy()
 
 st.sidebar.markdown("---")
-d1,d2 = st.sidebar.columns(2)
-start_f = d1.date_input("Début Inondation", datetime(2024,8,1))
-end_f = d2.date_input("Fin Inondation", datetime(2024,9,30))
-flood_threshold = st.sidebar.slider("Seuil Détection (dB)", 2.0,10.0,4.0,0.5)
+st.sidebar.info("""
+**Données affichées :**
+- 🏠 Bâtiments (OSM)
+- 🛣️ Réseau Routier (OSM)
+- 🟧 Limites Admin (GADM)
+""")
 
 # ═════════════════════════════════════════════════════════════════
-# 4. LOGIQUE ANALYSE
+# 4. AFFICHAGE PRINCIPAL
 # ═════════════════════════════════════════════════════════════════
-st.title("🌊 Analyse des Infrastructures Impactées")
 
-if st.button("🚀 LANCER L'ANALYSE", type="primary"):
-    st.session_state.analysis_done=True
-    with st.spinner("Récupération des données et analyse..."):
-        full_aoi_ee = ee.Geometry(mapping(selected_zone.unary_union))
-        st.session_state.flood_mask = get_flood_mask(full_aoi_ee,"2023-01-01","2023-05-01",str(start_f),str(end_f),flood_threshold)
-        st.session_state.precip = get_precip_cumul(full_aoi_ee,str(start_f),str(end_f))
-        buildings_gdf = get_buildings(selected_zone)
+st.title(f"Visualiseur d'Infrastructures : {choice if selected_zone is not None else ''}")
+
+if selected_zone is not None:
+    with st.spinner("Extraction des données OpenStreetMap en cours..."):
+        buildings, routes = get_osm_data(selected_zone)
         
-        # Intersection bâtiments impactés
-        if st.session_state.flood_mask and not buildings_gdf.empty:
-            infra_to_check = buildings_gdf.head(2000).copy()
-            features=[]
-            for i,row in infra_to_check.iterrows():
-                geom = mapping(row.geometry)
-                props={'osm_index':i,'type':str(row.get('amenity', row.get('building','Inconnu'))),'name':str(row.get('name','Sans nom'))}
-                features.append(ee.Feature(ee.Geometry(geom),props))
-            fc_infra = ee.FeatureCollection(features)
-            impact_results = st.session_state.flood_mask.reduceRegions(fc_infra, ee.Reducer.mean(), 10).filter(ee.Filter.gt('mean',0)).getInfo()
-            impacted_indices = [f['properties']['osm_index'] for f in impact_results['features']]
-            st.session_state.impacted_infra = infra_to_check.loc[impacted_indices].copy()
-        else:
-            st.session_state.impacted_infra = gpd.GeoDataFrame()
-        
-        # Analyse par polygone
-        temp_list=[]
-        for idx,row in selected_zone.iterrows():
-            geom_ee = ee.Geometry(mapping(row.geometry))
-            t_pop,e_pop = get_population_stats(geom_ee,st.session_state.flood_mask)
-            f_area = get_area_stats(geom_ee,st.session_state.flood_mask)
-            if not st.session_state.impacted_infra.empty:
-                infra_in_poly = st.session_state.impacted_infra[st.session_state.impacted_infra.intersects(row.geometry)]
-                counts = infra_in_poly['amenity'].fillna('Bâtiment/Résidentiel').value_counts().to_dict()
-                n_total_infra=len(infra_in_poly)
-            else: counts={}; n_total_infra=0
-            temp_list.append({
-                'name':row.get('NAME_2',row.get('NAME_1','Zone')),
-                'pop_total':t_pop,'pop_exposed':e_pop,
-                'flood_ha':round(f_area,2),'n_infra':n_total_infra,
-                'infra_details':counts,'geometry':row.geometry
-            })
-        st.session_state.results_gdf = gpd.GeoDataFrame(temp_list,crs="EPSG:4326")
-        st.session_state.stats = {
-            "pop_exposed": sum(d['pop_exposed'] for d in temp_list),
-            "total_pop": sum(d['pop_total'] for d in temp_list),
-            "total_flood_ha": sum(d['flood_ha'] for d in temp_list),
-            "total_infra": len(st.session_state.impacted_infra)
+    # --- Statistiques ---
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Bâtiments détectés", len(buildings) if buildings is not None else 0)
+    c2.metric("Segments de route", len(routes) if routes is not None else 0)
+    c3.metric("Zone Admin", choice)
+
+    # --- Carte ---
+    center = selected_zone.centroid.iloc[0]
+    m = folium.Map(location=[center.y, center.x], zoom_start=13, tiles="cartodbpositron")
+
+    # 1. Limite Administrative
+    folium.GeoJson(
+        selected_zone,
+        name="Limites Administratives",
+        style_function=lambda x: {
+            'fillColor': '#ff7800', 
+            'color': '#ff7800', 
+            'weight': 3, 
+            'fillOpacity': 0.1
         }
+    ).add_to(m)
 
-# ═════════════════════════════════════════════════════════════════
-# 5. AFFICHAGE RÉSULTATS
-# ═════════════════════════════════════════════════════════════════
-if st.session_state.analysis_done:
-    m1,m2,m3,m4=st.columns(4)
-    m1.metric("Pop. Exposée",f"{st.session_state.stats.get('pop_exposed',0):,}")
-    m2.metric("Superficie Inondée",f"{st.session_state.stats.get('total_flood_ha',0):,} ha")
-    m3.metric("Pluviométrie (moy)",f"{st.session_state.precip:.1f} mm")
-    m4.metric("Infrastructures Touchées",f"{st.session_state.stats.get('total_infra',0):,}")
+    # 2. Réseau Routier
+    if routes is not None and not routes.empty:
+        folium.GeoJson(
+            routes,
+            name="Routes & Chemins",
+            style_function=lambda x: {
+                'color': '#555555', 
+                'weight': 1.5, 
+                'opacity': 0.8
+            }
+        ).add_to(m)
+
+    # 3. Bâtiments
+    if buildings is not None and not buildings.empty:
+        # Création d'une colonne type simplifiée pour le style
+        buildings['display_type'] = buildings['amenity'].fillna(buildings['building']).fillna('Bâtiment')
+        
+        folium.GeoJson(
+            buildings,
+            name="Bâtiments & Infrastructures",
+            style_function=lambda x: {
+                'fillColor': '#2ecc71', 
+                'color': '#27ae60', 
+                'weight': 1, 
+                'fillOpacity': 0.7
+            },
+            tooltip=folium.GeoJsonTooltip(
+                fields=['display_type', 'name'], 
+                aliases=['Type:', 'Nom:'],
+                localize=True
+            )
+        ).add_to(m)
+
+    # Contrôle des couches
+    folium.LayerControl().add_to(m)
     
-    col_map,col_list=st.columns([3,1])
-    with col_list:
-        st.markdown("### 🏘️ Typologie des Impacts")
-        if not st.session_state.impacted_infra.empty:
-            summary=st.session_state.impacted_infra['amenity'].fillna('Bâtiment/Logement').value_counts()
-            st.dataframe(summary,use_container_width=True)
-        else: st.warning("Aucune infrastructure touchée détectée.")
-        st.markdown("---")
-        st.markdown("### 📍 Bilan par Secteur")
-        for _,r in st.session_state.results_gdf.iterrows():
-            with st.expander(f"**{r['name']}**"):
-                st.write(f"🌊 Inondé : {r['flood_ha']:,} ha")
-                st.write(f"🏠 Infras touchées : {r['n_infra']}")
-                if r['infra_details']:
-                    for k,v in r['infra_details'].items():
-                        st.caption(f"- {k}: {v}")
+    # Affichage de la carte
+    st_folium(m, width="100%", height=700, key="osm_viewer_map")
+    
+    # --- Table des données (optionnel) ---
+    if st.checkbox("Afficher la liste des infrastructures"):
+        if not buildings.empty:
+            st.dataframe(buildings[['name', 'display_type']].dropna(subset=['name']), use_container_width=True)
+        else:
+            st.write("Aucune donnée textuelle disponible pour ces bâtiments.")
 
-    with col_map:
-        center = selected_zone.centroid.iloc[0]
-        m=folium.Map(location=[center.y,center.x],zoom_start=11,tiles="cartodbpositron")
-        folium.GeoJson(selected_zone,name="Limite administrative",
-                       style_function=lambda x:{'fillColor':'none','color':'#ff7800','weight':4,'opacity':0.7}).add_to(m)
-        if st.session_state.flood_mask:
-            try:
-                map_id=st.session_state.flood_mask.getMapId({'palette':['#0077be']})
-                folium.TileLayer(tiles=map_id['tile_fetcher'].url_format,
-                                 attr='Google Earth Engine',name='Masque Inondation',
-                                 overlay=True,opacity=0.6).add_to(m)
-            except: pass
-        if not st.session_state.impacted_infra.empty:
-            folium.GeoJson(st.session_state.impacted_infra,name="Infrastructures Impactées",
-                           style_function=lambda x:{'fillColor':'#e31a1c','color':'#800026','weight':1.5,'fillOpacity':0.9},
-                           tooltip=folium.GeoJsonTooltip(fields=['amenity','name'],aliases=['Type:','Nom:'])).add_to(m)
-        folium.LayerControl().add_to(m)
-        st_folium(m,width="100%",height=700,key="map_final")
 else:
-    st.info("Sélectionnez une zone et lancez l'analyse pour visualiser les dégâts.")
+    st.warning("Veuillez sélectionner une zone administrative dans la barre latérale.")
