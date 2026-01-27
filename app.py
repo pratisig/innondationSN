@@ -23,44 +23,46 @@ st.set_page_config(
     layout="wide"
 )
 
-# Initialisation GEE robuste aux variations de noms de secrets
+# Initialisation GEE optimisée avec gestion du Project ID
 @st.cache_resource
 def init_gee_singleton():
+    """Initialise Google Earth Engine avec gestion robuste des secrets et du projet."""
     try:
-        # 1. Essayer d'abord l'initialisation par défaut (si déjà authentifié localement)
-        ee.Initialize()
-        return True
-    except Exception:
-        # 2. Sinon, chercher dans les secrets de Streamlit Cloud
-        # On teste plusieurs variantes de noms de clés possibles
-        possible_keys = ["gee_service_account", "GEE_SERVICE_ACCOUNT", "GEE_SERVICE_ACCOUNT_KEY"]
-        key_found = None
-        
-        for k in possible_keys:
-            if k in st.secrets:
-                key_found = st.secrets[k]
-                break
-        
-        if key_found:
+        # Recherche des secrets dans Streamlit Cloud
+        secret_key = "gee_service_account"
+        if secret_key in st.secrets:
             try:
-                # Si le secret est déjà un dictionnaire (Streamlit le parse souvent auto)
-                if isinstance(key_found, dict):
-                    credentials = ee.ServiceAccountCredentials(key_found["client_email"], key_data=json.dumps(key_found))
-                else:
-                    # Si c'est une chaîne de caractères JSON
-                    key_dict = json.loads(key_found)
-                    credentials = ee.ServiceAccountCredentials(key_dict["client_email"], key_data=key_found)
+                credentials_info = st.secrets[secret_key]
                 
-                ee.Initialize(credentials)
+                # Streamlit peut fournir le secret comme dict ou comme chaîne JSON
+                if isinstance(credentials_info, str):
+                    credentials_info = json.loads(credentials_info)
+                
+                # Extraction du Project ID (Crucial pour les nouvelles API Cloud)
+                project_id = credentials_info.get('project_id')
+                
+                # Conversion des secrets en credentials GEE
+                credentials = ee.ServiceAccountCredentials(
+                    credentials_info['client_email'],
+                    key_data=json.dumps(credentials_info)
+                )
+                
+                # Initialisation avec le projet spécifié
+                if project_id:
+                    ee.Initialize(credentials, project=project_id)
+                else:
+                    ee.Initialize(credentials)
                 return True
             except Exception as e:
-                st.error(f"Erreur lors de la lecture du JSON GEE : {e}")
+                st.error(f"Erreur d'authentification GEE : {e}")
                 return False
         else:
-            # Afficher les clés réellement trouvées pour aider l'utilisateur
-            found_keys = list(st.secrets.to_dict().keys())
-            st.error(f"Clé GEE non trouvée. Clés disponibles dans vos secrets : {found_keys}")
-            return False
+            # Tentative d'initialisation par défaut (environnement local)
+            ee.Initialize()
+            return True
+    except Exception as e:
+        st.warning(f"GEE non disponible : {e}")
+        return False
 
 gee_available = init_gee_singleton()
 
@@ -97,7 +99,8 @@ def detect_flood(aoi, d1, d2, d3, d4, threshold=-1.25):
         flood = s1.filterDate(d3, d4).median()
 
         diff = flood.subtract(ref)
-        flood_mask = diff.lt(threshold)
+        # On nomme explicitement la bande pour le calcul de stats plus tard
+        flood_mask = diff.lt(threshold).rename('flood_mask')
 
         slope = ee.Algorithms.Terrain(ee.Image("USGS/SRTMGL1_003")).select('slope')
         flood_mask = flood_mask.updateMask(slope.lt(5))
@@ -210,14 +213,17 @@ st.title(f"🌊 FloodWatch WA : {st.session_state.zone_name}")
 if st.session_state.selected_zone is not None:
     if st.button("🚀 LANCER L'ANALYSE D'IMPACT", type="primary", use_container_width=True):
         if not gee_available:
-            st.error("Google Earth Engine n'est pas disponible. Vérifiez vos secrets Streamlit.")
+            st.error("L'analyse satellite (GEE) est désactivée. Vérifiez vos secrets 'gee_service_account' et assurez-vous que 'project_id' y figure.")
         else:
             with st.spinner("Analyse en cours..."):
                 geom_union = st.session_state.selected_zone.unary_union
                 aoi_json = mapping(geom_union)
                 aoi_ee = ee.Geometry(aoi_json)
                 
+                # 1. Détection Inondation
                 flood_img = detect_flood(aoi_ee, str(d_ref[0]), str(d_ref[1]), str(d_flood[0]), str(d_flood[1]))
+                
+                # 2. Population
                 t_pop = get_pop_stats_cached(aoi_json)
                 
                 e_pop = 0
@@ -228,17 +234,27 @@ if st.session_state.selected_zone is not None:
                     ).get('population').getInfo()
                     e_pop = int(e_pop_val) if e_pop_val else 0
                 
+                # 3. Infrastructures OSM
                 b_json, r_json = get_osm_assets_cached(aoi_json)
+                
+                # 4. Climat
                 centroid = geom_union.centroid
                 df_clim_json = get_climate_data([centroid.x, centroid.y], str(d_flood[0]), str(d_flood[1]))
                 
+                # 5. Surface & MapId
                 area_ha = 0
                 mask_id = None
                 if flood_img:
                     mask_id = flood_img.getMapId({'palette': ['#00BFFF']})
-                    area_px = flood_img.multiply(ee.Image.pixelArea()).reduceRegion(
-                        reducer=ee.Reducer.sum(), geometry=aoi_ee, scale=10, maxPixels=1e9
-                    ).get('flood').getInfo()
+                    # On réduit la région sur la bande 'flood_mask'
+                    stats = flood_img.multiply(ee.Image.pixelArea()).reduceRegion(
+                        reducer=ee.Reducer.sum(), 
+                        geometry=aoi_ee, 
+                        scale=10, 
+                        maxPixels=1e9
+                    ).getInfo()
+                    # On récupère la valeur de la première bande disponible
+                    area_px = list(stats.values())[0] if stats else 0
                     area_ha = (area_px / 10000) if area_px else 0
 
                 st.session_state.results = {
