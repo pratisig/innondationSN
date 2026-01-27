@@ -23,7 +23,7 @@ st.set_page_config(page_title="Flood Analysis WA", layout="wide")
 ox.settings.timeout = 60
 ox.settings.use_cache = True
 
-# Initialisation des variables d'état
+# Initialisation des variables d'état pour éviter les erreurs KeyError
 if 'analysis_done' not in st.session_state:
     st.session_state.analysis_done = False
 if 'flood_mask' not in st.session_state:
@@ -32,8 +32,15 @@ if 'osm_data' not in st.session_state:
     st.session_state.osm_data = gpd.GeoDataFrame()
 if 'results_gdf' not in st.session_state:
     st.session_state.results_gdf = gpd.GeoDataFrame()
+if 'precip' not in st.session_state:
+    st.session_state.precip = 0.0
 if 'stats' not in st.session_state:
-    st.session_state.stats = {}
+    st.session_state.stats = {
+        "pop_exposed": 0,
+        "total_pop": 0,
+        "total_flood_ha": 0,
+        "total_infra": 0
+    }
 
 # ────────── INITIALISATION GEE ──────────
 @st.cache_resource
@@ -181,7 +188,7 @@ if selected_zone is None or selected_zone.empty:
     selected_zone = gpd.GeoDataFrame([{"NAME_2":"Test","geometry": shape({"type":"Polygon","coordinates":[[[-17.5,14.6],[-17.5,14.8],[-17.3,14.8],[-17.3,14.6],[-17.5,14.6]]]})}]).set_crs("EPSG:4326")
 
 # ═════════════════════════════════════════════════════════════════
-# 4. LOGIQUE D'ANALYSE
+# 4. LOGIQUE d'ANALYSE
 # ═════════════════════════════════════════════════════════════════
 
 st.title("🌊 Tableau de Bord d'Impact Inondation")
@@ -223,7 +230,7 @@ if st.button("🚀 LANCER L'ANALYSE", type="primary"):
         
         st.session_state.results_gdf = gpd.GeoDataFrame(temp_list, crs="EPSG:4326")
         
-        # Global stats pour les metrics
+        # Global stats
         st.session_state.stats = {
             "pop_exposed": sum(d['pop_exposed'] for d in temp_list),
             "total_pop": sum(d['pop_total'] for d in temp_list),
@@ -237,10 +244,11 @@ if st.button("🚀 LANCER L'ANALYSE", type="primary"):
 
 if st.session_state.analysis_done:
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Pop. Exposée", f"{st.session_state.stats['pop_exposed']:,}")
-    m2.metric("Superficie Inondée", f"{st.session_state.stats['total_flood_ha']:,} ha")
+    # Utilisation de .get() pour sécuriser l'accès aux données
+    m1.metric("Pop. Exposée", f"{st.session_state.stats.get('pop_exposed', 0):,}")
+    m2.metric("Superficie Inondée", f"{st.session_state.stats.get('total_flood_ha', 0):,} ha")
     m3.metric("Pluviométrie (moy)", f"{st.session_state.precip:.1f} mm")
-    m4.metric("Infrastructures", f"{st.session_state.stats['total_infra']:,}")
+    m4.metric("Infrastructures", f"{st.session_state.stats.get('total_infra', 0):,}")
 
     col_map, col_list = st.columns([3, 1])
     
@@ -269,7 +277,7 @@ if st.session_state.analysis_done:
                 ).add_to(m)
             except: pass
 
-        # Polygones avec Popups enrichis
+        # Polygones avec Popups
         for _, row in st.session_state.results_gdf.iterrows():
             popup_text = f"""
             <b>Zone:</b> {row['name']}<br>
@@ -285,7 +293,7 @@ if st.session_state.analysis_done:
                 tooltip=row['name']
             ).add_child(folium.Popup(popup_text, max_width=250)).add_to(m)
 
-        # Points Infrastructures (Uniquement les services critiques)
+        # Points Infrastructures
         if not st.session_state.osm_data.empty:
             infras = st.session_state.osm_data[st.session_state.osm_data['amenity'].notna()]
             for _, r in infras.iterrows():
