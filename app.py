@@ -81,7 +81,6 @@ def advanced_flood_detection(aoi, ref_start, ref_end, flood_start, flood_end, th
         crisis_db = ee.Image(10).multiply(s1_crisis.log10())
         
         # Détection (Inondation = baisse de la rétrodiffusion radar)
-        # On cherche les zones où le signal a chuté de plus de X dB
         flood_raw = ref_db.subtract(crisis_db).gt(threshold_db).rename('flood')
         
         # Masquage Eau Permanente (JRC Global Surface Water)
@@ -95,9 +94,11 @@ def advanced_flood_detection(aoi, ref_start, ref_end, flood_start, flood_end, th
         # Application des masques
         flood_final = flood_raw.updateMask(mask_not_permanent).updateMask(mask_flat)
         
-        # Nettoyage morphologique
-        flood_final = flood_final.focal_mode(radius=1, shape='circle', iterations=1)
-        connected = flood_final.connectedPixelCount(15) # Filtre plus fort pour le bruit
+        # Nettoyage morphologique corrigé (Utilisation de Kernel au lieu de l'argument shape)
+        kernel = ee.Kernel.circle(radius=1)
+        flood_final = flood_final.focal_mode(kernel=kernel, iterations=1)
+        
+        connected = flood_final.connectedPixelCount(15) 
         flood_final = flood_final.updateMask(connected.gte(min_pixels))
         
         return {
@@ -125,6 +126,16 @@ def get_stats(aoi_ee, flood_mask):
         
         return int(exposed_pop), float(area / 10000)
     except: return 0, 0.0
+
+def get_osm_data(_gdf):
+    try:
+        poly = _gdf.unary_union
+        tags = {'building': True}
+        try: b = ox.features_from_polygon(poly, tags=tags)
+        except: b = ox.geometries_from_polygon(poly, tags=tags)
+        if b.empty: return pd.DataFrame(), None
+        return b.reset_index().clip(_gdf), None
+    except: return pd.DataFrame(), None
 
 # ═════════════════════════════════════════════════════════════════
 # 3. INTERFACE
@@ -163,37 +174,42 @@ elif mode == "Upload":
             st.session_state.zone_name = up.name
 
 st.sidebar.markdown("## 📅 2. Paramètres")
-ref_dates = st.sidebar.date_input("Période Sèche", [datetime(2025, 1, 1), datetime(2025, 4, 30)])
-flood_dates = st.sidebar.date_input("Période Humide", [datetime(2025, 6, 1), datetime(2025, 9, 30)])
+# Utilisation de listes pour s'assurer que date_input renvoie toujours 2 valeurs
+d_dry = st.sidebar.date_input("Période Sèche", [datetime(2025, 1, 1), datetime(2025, 4, 30)])
+d_wet = st.sidebar.date_input("Période Humide", [datetime(2025, 6, 1), datetime(2025, 9, 30)])
 sens = st.sidebar.slider("Sensibilité (dB)", 0.5, 5.0, 1.5)
 noise = st.sidebar.slider("Filtre Bruit", 1, 15, 5)
 
 st.title(f"🌊 FloodWatch : {st.session_state.zone_name}")
 
 if st.session_state.selected_zone is not None:
+    # Bouton d'analyse
     if st.button("🚀 ANALYSER LA ZONE", type="primary", use_container_width=True):
-        with st.spinner("Traitement des données satellites..."):
-            aoi_ee = ee.Geometry(mapping(st.session_state.selected_zone.unary_union))
-            res = advanced_flood_detection(
-                aoi_ee, 
-                str(ref_dates[0]), str(ref_dates[1]), 
-                str(flood_dates[0]), str(flood_dates[1]), 
-                sens, noise
-            )
-            
-            if res:
-                exposed_pop, flood_ha = get_stats(aoi_ee, res['flood_mask'])
-                buildings, _ = get_osm_data(st.session_state.selected_zone)
+        if len(d_dry) < 2 or len(d_wet) < 2:
+            st.error("Veuillez sélectionner une plage de dates (début et fin) pour chaque période.")
+        else:
+            with st.spinner("Traitement des données satellites..."):
+                aoi_ee = ee.Geometry(mapping(st.session_state.selected_zone.unary_union))
+                res = advanced_flood_detection(
+                    aoi_ee, 
+                    str(d_dry[0]), str(d_dry[1]), 
+                    str(d_wet[0]), str(d_wet[1]), 
+                    sens, noise
+                )
                 
-                # Sauvegarde dans le state pour éviter la disparition au refresh
-                st.session_state.results = {
-                    'pop': exposed_pop,
-                    'area': flood_ha,
-                    'buildings': len(buildings) if not buildings.empty else 0,
-                    'mask_id': res['flood_mask'].getMapId({'palette': ['#00BFFF']}) if res['flood_mask'] else None
-                }
+                if res:
+                    exposed_pop, flood_ha = get_stats(aoi_ee, res['flood_mask'])
+                    buildings, _ = get_osm_data(st.session_state.selected_zone)
+                    
+                    # Sauvegarde dans le state pour éviter la disparition au refresh
+                    st.session_state.results = {
+                        'pop': exposed_pop,
+                        'area': flood_ha,
+                        'buildings': len(buildings) if not buildings.empty else 0,
+                        'mask_id': res['flood_mask'].getMapId({'palette': ['#00BFFF']}) if res['flood_mask'] else None
+                    }
 
-    # Affichage des résultats s'ils existent dans le state
+    # Affichage permanent des résultats s'ils existent dans le state
     if st.session_state.results:
         res_data = st.session_state.results
         c1, c2, c3 = st.columns(3)
@@ -204,7 +220,7 @@ if st.session_state.selected_zone is not None:
         # Carte
         center = st.session_state.selected_zone.centroid.iloc[0]
         m = folium.Map(location=[center.y, center.x], zoom_start=12, tiles="cartodbpositron")
-        folium.GeoJson(st.session_state.selected_zone, name="Zone", style_function=lambda x: {'fillColor': 'none', 'color': 'black'}).add_to(m)
+        folium.GeoJson(st.session_state.selected_zone, name="Zone", style_function=lambda x: {'fillColor': 'none', 'color': 'black', 'weight': 2}).add_to(m)
         
         if res_data['mask_id']:
             folium.TileLayer(
@@ -218,16 +234,7 @@ if st.session_state.selected_zone is not None:
             st.warning("Aucune inondation détectée avec ces paramètres.")
             
         folium.LayerControl().add_to(m)
-        st_folium(m, width="100%", height=600, key="map_final")
+        st_folium(m, width="100%", height=600, key="map_final_static")
 
 else:
     st.info("Sélectionnez une zone pour commencer.")
-
-def get_osm_data(_gdf):
-    try:
-        poly = _gdf.unary_union
-        tags = {'building': True}
-        try: b = ox.features_from_polygon(poly, tags=tags)
-        except: b = ox.geometries_from_polygon(poly, tags=tags)
-        return b.reset_index().clip(_gdf), None
-    except: return pd.DataFrame(), None
