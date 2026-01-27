@@ -4,7 +4,7 @@ import json
 import math
 import tempfile
 from datetime import datetime
-
+import ee
 import streamlit as st
 import pandas as pd
 import numpy as np
