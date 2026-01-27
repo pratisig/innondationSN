@@ -20,7 +20,7 @@ import ee
 st.set_page_config(page_title="Flood Analysis WA", layout="wide")
 
 # Configuration globale OSMnx
-ox.settings.timeout = 60
+ox.settings.timeout = 120
 ox.settings.use_cache = True
 
 # Initialisation des variables d'état
@@ -88,11 +88,13 @@ def get_flood_mask(aoi_ee, start_ref, end_ref, start_flood, end_flood, threshold
         img_ref = s1.filterDate(start_ref, end_ref).median().clip(aoi_ee)
         img_flood = s1.filterDate(start_flood, end_flood).min().clip(aoi_ee)
         
+        # Filtre de réduction du bruit
         img_ref = img_ref.focal_median(50, 'circle', 'meters')
         img_flood = img_flood.focal_median(50, 'circle', 'meters')
 
         diff = img_ref.subtract(img_flood)
-        return diff.gt(threshold).selfMask()
+        # Renvoie 1 pour l'eau, masqué ailleurs
+        return diff.gt(threshold).rename('flood').selfMask()
     except Exception: return None
 
 def get_precip_cumul(aoi_ee, start_date, end_date):
@@ -112,7 +114,7 @@ def get_area_stats(aoi_ee, flood_mask):
     try:
         area_img = flood_mask.multiply(ee.Image.pixelArea())
         stats = area_img.reduceRegion(reducer=ee.Reducer.sum(), geometry=aoi_ee, scale=30, maxPixels=1e9)
-        area_m2 = stats.get('VV').getInfo() or 0
+        area_m2 = stats.get('flood').getInfo() or 0
         return area_m2 / 10000  # Hectares
     except: return 0
 
@@ -147,7 +149,7 @@ def get_osm_buildings(_gdf_aoi):
         data = ox.geometries_from_polygon(poly, tags=tags)
         if data.empty: return gpd.GeoDataFrame()
         
-        # Filtrer et nettoyer
+        # Nettoyage : conversion en polygones et suppression du bruit
         data = data[data.geometry.type.isin(['Polygon', 'MultiPolygon'])]
         return data.clip(_gdf_aoi)
     except Exception: return gpd.GeoDataFrame()
@@ -206,20 +208,33 @@ if st.button("🚀 LANCER L'ANALYSE", type="primary"):
         # 3. Récupération OSM
         buildings_gdf = get_osm_buildings(selected_zone)
         
-        # 4. Conversion du masque GEE en vecteur pour intersection spatiale locale
-        # Note: On vectorise uniquement pour l'intersection avec les bâtiments OSM
-        impacted_infra_list = []
+        # 4. Identification des infrastructures impactées via échantillonnage GEE
+        # Cette méthode est beaucoup plus fiable que reduceToVectors
         if st.session_state.flood_mask and not buildings_gdf.empty:
-            flood_vectors = st.session_state.flood_mask.reduceToVectors(
-                geometry=full_aoi_ee, scale=30, maxPixels=1e9
+            # Création de points à partir des centroïdes des bâtiments pour l'échantillonnage
+            centroids = buildings_gdf.copy()
+            centroids['geometry'] = centroids.geometry.centroid
+            
+            # Conversion en FeatureCollection GEE
+            features = []
+            for i, row in centroids.iterrows():
+                geom = mapping(row.geometry)
+                features.append(ee.Feature(ee.Geometry.Point(geom['coordinates']), {'osm_id': str(i)}))
+            
+            fc_centroids = ee.FeatureCollection(features)
+            
+            # Échantillonnage : on regarde si le pixel 'flood' est présent sous le bâtiment
+            sampled = st.session_state.flood_mask.sampleRegions(
+                collection=fc_centroids,
+                scale=10, # Plus précis pour les bâtiments
+                geometries=False
             ).getInfo()
             
-            if flood_vectors and 'features' in flood_vectors:
-                flood_polys = [shape(f['geometry']) for f in flood_vectors['features']]
-                flood_gdf = gpd.GeoDataFrame(geometry=flood_polys, crs="EPSG:4326")
-                
-                # Intersection spatiale : bâtiments qui touchent les zones inondées
-                st.session_state.impacted_infra = gpd.sjoin(buildings_gdf, flood_gdf, how="inner", predicate="intersects")
+            # Récupération des IDs impactés
+            impacted_ids = [f['properties']['osm_id'] for f in sampled['features'] if f['properties'].get('flood') == 1]
+            st.session_state.impacted_infra = buildings_gdf.loc[impacted_ids].copy()
+        else:
+            st.session_state.impacted_infra = gpd.GeoDataFrame()
         
         # 5. Analyse par polygone administratif
         temp_list = []
@@ -230,7 +245,10 @@ if st.button("🚀 LANCER L'ANALYSE", type="primary"):
             
             # Filtrer les infrastructures impactées dans ce polygone spécifique
             if not st.session_state.impacted_infra.empty:
-                infra_in_poly = st.session_state.impacted_infra.clip(row.geometry)
+                # On utilise sjoin pour être sûr de l'appartenance au polygone
+                poly_gdf = gpd.GeoDataFrame(geometry=[row.geometry], crs="EPSG:4326")
+                infra_in_poly = gpd.sjoin(st.session_state.impacted_infra, poly_gdf, how="inner", predicate="intersects")
+                
                 counts = infra_in_poly['amenity'].fillna('Bâtiment/Résidentiel').value_counts().to_dict()
                 n_total_infra = len(infra_in_poly)
             else:
@@ -275,6 +293,8 @@ if st.session_state.analysis_done:
         if not st.session_state.impacted_infra.empty:
             summary = st.session_state.impacted_infra['amenity'].fillna('Résidentiel').value_counts()
             st.dataframe(summary, use_container_width=True)
+        else:
+            st.warning("Aucun bâtiment détecté dans les zones inondées.")
         
         st.markdown("---")
         st.markdown("### 📍 Détails par zone")
@@ -311,7 +331,7 @@ if st.session_state.analysis_done:
                 ).add_to(m)
             except: pass
 
-        # 3. Polygones invisibles pour les Popups de zone
+        # 3. Polygones pour Popups de zone
         for _, row in st.session_state.results_gdf.iterrows():
             infra_str = "<br>".join([f"- {k}: {v}" for k, v in row['infra_details'].items()])
             popup_content = f"""
