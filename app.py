@@ -53,6 +53,7 @@ def get_flood_mask(aoi_ee, start_flood, end_flood, threshold=4.0):
     """Génère un masque d'inondation Sentinel-1 via GEE"""
     if not gee_available: return None
     try:
+        # Période de référence fixe pour la comparaison
         start_ref, end_ref = "2023-01-01", "2023-04-30"
         
         def get_s1_collection(start, end):
@@ -66,6 +67,7 @@ def get_flood_mask(aoi_ee, start_flood, end_flood, threshold=4.0):
         img_ref = get_s1_collection(start_ref, end_ref).median().clip(aoi_ee)
         img_flood = get_s1_collection(start_flood, end_flood).min().clip(aoi_ee)
         
+        # Filtre de réduction du bruit (Speckle)
         img_ref = img_ref.focal_median(50, 'circle', 'meters')
         img_flood = img_flood.focal_median(50, 'circle', 'meters')
 
@@ -73,14 +75,63 @@ def get_flood_mask(aoi_ee, start_flood, end_flood, threshold=4.0):
         return diff.gt(threshold).rename('flood').selfMask()
     except: return None
 
+def get_population_stats(aoi_ee, flood_mask):
+    """Calcule la population via WorldPop mosaïquée"""
+    if not gee_available: return 0, 0
+    try:
+        # Utilisation de la méthode mosaïque suggérée pour assurer la couverture
+        pop_dataset = ee.ImageCollection("WorldPop/GP/100m/pop") \
+                        .filterDate('2020-01-01', '2021-01-01') \
+                        .mosaic().clip(aoi_ee)
+        
+        # Population totale
+        stats_total = pop_dataset.reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=aoi_ee,
+            scale=100,
+            maxPixels=1e9
+        )
+        total_pop = stats_total.get('population').getInfo() or 0
+        
+        exposed_pop = 0
+        if flood_mask:
+            # Population exposée via masque
+            stats_exposed = pop_dataset.updateMask(flood_mask).reduceRegion(
+                reducer=ee.Reducer.sum(),
+                geometry=aoi_ee,
+                scale=100,
+                maxPixels=1e9
+            )
+            exposed_pop = stats_exposed.get('population').getInfo() or 0
+            
+        return int(total_pop), int(exposed_pop)
+    except Exception as e:
+        st.error(f"Erreur Population: {e}")
+        return 0, 0
+
+def get_area_stats(aoi_ee, flood_mask):
+    """Calcule la superficie inondée en hectares"""
+    if not gee_available or not flood_mask: return 0.0
+    try:
+        area_m2 = flood_mask.multiply(ee.Image.pixelArea()).reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=aoi_ee,
+            scale=10,
+            maxPixels=1e9
+        ).get('flood').getInfo()
+        return (area_m2 or 0) / 10000
+    except: return 0.0
+
 def get_osm_data(_gdf_aoi):
     """Récupère bâtiments et routes via OSMnx"""
-    if _gdf_aoi is None or _gdf_aoi.empty: return None, None
+    if _gdf_aoi is None or _gdf_aoi.empty: return gpd.GeoDataFrame(), gpd.GeoDataFrame()
     try:
         poly = _gdf_aoi.unary_union
+        # Récupération du réseau routier
         graph = ox.graph_from_polygon(poly, network_type='all', simplify=True)
         gdf_routes = ox.graph_to_gdfs(graph, nodes=False, edges=True).reset_index().clip(_gdf_aoi)
         
+        # Récupération des bâtiments
         tags = {'building': True, 'amenity': True, 'healthcare': True, 'education': True}
         try:
             gdf_buildings = ox.features_from_polygon(poly, tags=tags)
@@ -93,68 +144,12 @@ def get_osm_data(_gdf_aoi):
         return gdf_buildings, gdf_routes
     except: return gpd.GeoDataFrame(), gpd.GeoDataFrame()
 
-def get_advanced_stats(aoi_ee, flood_mask):
-    """Calcule population et superficie via GEE avec WorldPop"""
-    if not gee_available:
-        return {"pop_total": 0, "pop_exposed": 0, "area_ha": 0}
-    
-    try:
-        # 1. Récupération de la population WorldPop (Utilisation de la version non-filtrée par date pour éviter le 0)
-        # WorldPop unconstrained global dataset
-        pop_collection = ee.ImageCollection("WorldPop/GP/100m/pop")
-        # On prend l'image la plus récente disponible
-        pop_img = pop_collection.filterBounds(aoi_ee).sort('system:time_start', False).first()
-        
-        if pop_img is None:
-            return {"pop_total": 0, "pop_exposed": 0, "area_ha": 0}
-
-        # Calcul Population Totale dans l'AOI
-        pop_total_res = pop_img.reduceRegion(
-            reducer=ee.Reducer.sum(),
-            geometry=aoi_ee,
-            scale=100,
-            maxPixels=1e9
-        ).get('population').getInfo()
-        
-        pop_total = round(pop_total_res) if pop_total_res else 0
-
-        # Calcul Population Exposée (si masque d'inondation disponible)
-        pop_exposed = 0
-        area_ha = 0
-        
-        if flood_mask is not None:
-            # Population dans les zones masquées
-            pop_exposed_res = pop_img.updateMask(flood_mask).reduceRegion(
-                reducer=ee.Reducer.sum(),
-                geometry=aoi_ee,
-                scale=100,
-                maxPixels=1e9
-            ).get('population').getInfo()
-            pop_exposed = round(pop_exposed_res) if pop_exposed_res else 0
-
-            # Superficie Inondée
-            area_m2_res = flood_mask.multiply(ee.Image.pixelArea()).reduceRegion(
-                reducer=ee.Reducer.sum(),
-                geometry=aoi_ee,
-                scale=10,
-                maxPixels=1e9
-            ).get('flood').getInfo()
-            area_ha = round((area_m2_res or 0) / 10000, 2)
-        
-        return {
-            "pop_total": pop_total,
-            "pop_exposed": pop_exposed,
-            "area_ha": area_ha
-        }
-    except Exception as e:
-        print(f"Erreur GEE Stats: {e}")
-        return {"pop_total": 0, "pop_exposed": 0, "area_ha": 0}
-
-def analyze_impacts(flood_mask, buildings_gdf):
-    """Analyse d'impact précise en injectant OSM dans GEE"""
+def analyze_impacted_infra(flood_mask, buildings_gdf):
+    """Vérifie quels bâtiments OSM touchent le masque d'inondation"""
     if flood_mask is None or buildings_gdf.empty: return gpd.GeoDataFrame()
     try:
-        infra_check = buildings_gdf.head(1500).copy()
+        # Limite pour performance
+        infra_check = buildings_gdf.head(2000).copy()
         features = []
         for i, row in infra_check.iterrows():
             features.append(ee.Feature(ee.Geometry(mapping(row.geometry)), {'idx': i}))
@@ -183,7 +178,7 @@ if 'analysis_triggered' not in st.session_state:
 if mode == "Liste Administrative":
     countries = {"Sénégal": "SEN", "Mali": "MLI", "Niger": "NER", "Burkina Faso": "BFA"}
     c_choice = st.sidebar.selectbox("Pays", list(countries.keys()))
-    level = st.sidebar.slider("Niveau Admin", 0, 5, 2)
+    level = st.sidebar.slider("Niveau Admin (0=Pays, 2=Département)", 0, 5, 2)
     gdf_base = load_gadm(countries[c_choice], level)
     if gdf_base is not None:
         col = f"NAME_{level}" if level > 0 else "COUNTRY"
@@ -236,27 +231,56 @@ if st.session_state.selected_zone is not None:
         st.session_state.analysis_triggered = True
 
     if st.session_state.analysis_triggered:
-        with st.spinner("Calcul des indicateurs avancés (Population, Bâtiments, GEE)..."):
-            # A. Préparation GEE & OSM
-            aoi_ee = ee.Geometry(mapping(st.session_state.selected_zone.unary_union))
-            buildings, routes = get_osm_data(st.session_state.selected_zone)
-            flood_mask = get_flood_mask(aoi_ee, str(start_f), str(end_f), threshold_val)
+        with st.spinner("Analyse spatiale en cours (WorldPop + OSM + Sentinel-1)..."):
+            # A. Préparation GEE & Masque
+            aoi_ee_global = ee.Geometry(mapping(st.session_state.selected_zone.unary_union))
+            flood_mask = get_flood_mask(aoi_ee_global, str(start_f), str(end_f), threshold_val)
             
-            # B. Statistiques Avancées (WorldPop)
-            adv_stats = get_advanced_stats(aoi_ee, flood_mask)
-            impacted_infra = analyze_impacts(flood_mask, buildings)
+            # B. Données OSM
+            buildings, routes = get_osm_data(st.session_state.selected_zone)
+            impacted_infra = analyze_impacted_infra(flood_mask, buildings)
+            
+            # C. Analyse par polygone (Boucle suggérée)
+            temp_list = []
+            for idx, row in st.session_state.selected_zone.iterrows():
+                geom_ee = ee.Geometry(mapping(row.geometry))
+                t_pop, e_pop = get_population_stats(geom_ee, flood_mask)
+                f_area = get_area_stats(geom_ee, flood_mask)
+                
+                # Détails infra pour ce polygone
+                if not impacted_infra.empty:
+                    infra_in_poly = impacted_infra[impacted_infra.intersects(row.geometry)]
+                    counts = infra_in_poly.get('amenity', infra_in_poly.get('building', 'Inconnu')).fillna('Résidentiel').value_counts().to_dict()
+                    n_total_infra = len(infra_in_poly)
+                else:
+                    counts = {}
+                    n_total_infra = 0
+                
+                temp_list.append({
+                    'name': row.get('NAME_2', row.get('NAME_1', st.session_state.zone_name)),
+                    'pop_total': t_pop,
+                    'pop_exposed': e_pop,
+                    'flood_ha': round(f_area, 2),
+                    'n_infra': n_total_infra,
+                    'infra_details': counts
+                })
+            
+            # Agrégation globale pour les KPIs
+            total_pop_exposed = sum(d['pop_exposed'] for d in temp_list)
+            total_pop_all = sum(d['pop_total'] for d in temp_list)
+            total_flood_ha = sum(d['flood_ha'] for d in temp_list)
             
             # --- SECTION 1: INDICATEURS CLÉS ---
             st.subheader("📊 Indicateurs de Risque")
             k1, k2, k3, k4 = st.columns(4)
             
             with k1:
-                st.metric("Population Totale", f"{adv_stats['pop_total']:,}")
+                st.metric("Population Totale", f"{total_pop_all:,}")
             with k2:
-                perc_pop = (adv_stats['pop_exposed'] / adv_stats['pop_total'] * 100) if adv_stats['pop_total'] > 0 else 0
-                st.metric("Population Exposée", f"{adv_stats['pop_exposed']:,}", f"{perc_pop:.1f}%", delta_color="inverse")
+                perc_pop = (total_pop_exposed / total_pop_all * 100) if total_pop_all > 0 else 0
+                st.metric("Population Exposée", f"{total_pop_exposed:,}", f"{perc_pop:.1f}%", delta_color="inverse")
             with k3:
-                st.metric("Surface Inondée", f"{adv_stats['area_ha']} ha")
+                st.metric("Surface Inondée", f"{total_flood_ha:,.2f} ha")
             with k4:
                 impact_rate = (len(impacted_infra) / len(buildings) * 100) if len(buildings) > 0 else 0
                 st.metric("Infrastructures Impactées", len(impacted_infra), f"{impact_rate:.1f}%", delta_color="inverse")
@@ -279,17 +303,18 @@ if st.session_state.selected_zone is not None:
                     st.info("Aucun impact infrastructurel détecté.")
 
             with c2:
-                fig_gauge = px.bar(x=[perc_pop], y=["Danger"], orientation='h', range_x=[0, 100],
-                                  title="Niveau d'Alerte Population (%)",
+                # Gauge de dangerosité basée sur le pourcentage de population
+                fig_gauge = px.bar(x=[perc_pop], y=["Alerte"], orientation='h', range_x=[0, 100],
+                                  title="Proportion de Population Affectée (%)",
                                   color=[perc_pop], color_continuous_scale="Reds")
-                fig_gauge.update_layout(height=150, margin=dict(t=40, b=0, l=0, r=0), xaxis_title="% Exposé")
+                fig_gauge.update_layout(height=180, margin=dict(t=40, b=0, l=0, r=0), xaxis_title="% Exposé")
                 st.plotly_chart(fig_gauge, use_container_width=True)
-                st.write(f"🛣️ **Réseau routier :** {len(routes)} segments analysés dans l'emprise.")
+                st.write(f"🛣️ **Réseau routier :** {len(routes)} segments analysés.")
 
             # --- SECTION 3: CARTOGRAPHIE ---
             st.subheader("🗺️ Visualisation Spatiale")
             center = st.session_state.selected_zone.centroid.iloc[0]
-            m = folium.Map(location=[center.y, center.x], zoom_start=13, tiles="cartodbpositron")
+            m = folium.Map(location=[center.y, center.x], zoom_start=12, tiles="cartodbpositron")
             
             if flood_mask:
                 try:
@@ -317,16 +342,13 @@ if st.session_state.selected_zone is not None:
             folium.LayerControl().add_to(m)
             st_folium(m, width="100%", height=600, key="result_map")
             
-            if not impacted_infra.empty:
-                st.subheader("📋 Inventaire des Bâtiments Touchés")
-                st.dataframe(impacted_infra[['name', 'type_clean']].dropna(subset=['name']), use_container_width=True)
+            # --- SECTION 4: TABLEAU RÉCAPITULATIF ---
+            st.subheader("📋 Bilan par Secteur")
+            res_df = pd.DataFrame(temp_list)
+            st.dataframe(res_df.drop(columns=['infra_details']), use_container_width=True)
     else:
-        center = st.session_state.selected_zone.centroid.iloc[0]
-        m_pre = folium.Map(location=[center.y, center.x], zoom_start=11, tiles="cartodbpositron")
-        folium.GeoJson(st.session_state.selected_zone, style_function=lambda x: {'color': 'orange', 'fillOpacity': 0.1}).add_to(m_pre)
-        st.info("Cliquez sur le bouton ci-dessus pour générer le rapport d'impact complet.")
-        st_folium(m_pre, width="100%", height=500, key="pre_view")
+        st.info("Veuillez cliquer sur 'Analyser' pour charger les données GEE et OSM.")
 else:
-    st.info("💡 Commencez par sélectionner une zone dans la barre latérale.")
+    st.info("💡 Sélectionnez une zone dans la barre latérale pour commencer.")
     m_default = folium.Map(location=[14.5, -14.5], zoom_start=6, tiles="cartodbpositron")
     st_folium(m_default, width="100%", height=500, key="default_map")
