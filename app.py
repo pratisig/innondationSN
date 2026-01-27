@@ -46,17 +46,25 @@ def get_osm_data(_gdf_aoi):
         poly = _gdf_aoi.unary_union
         
         # 1. Récupération des routes
+        # Utilisation de graph_from_polygon pour obtenir le réseau routier
         graph = ox.graph_from_polygon(poly, network_type='all', simplify=True)
         gdf_routes = ox.graph_to_gdfs(graph, nodes=False, edges=True)
         
         # 2. Récupération des bâtiments et équipements
+        # Correction : geometries_from_polygon est devenu features_from_polygon dans les versions récentes
         tags = {
             'building': True, 
             'amenity': True,
             'healthcare': True,
             'education': True
         }
-        gdf_buildings = ox.geometries_from_polygon(poly, tags=tags)
+        
+        try:
+            # Essayer la nouvelle API (v1.3.0+)
+            gdf_buildings = ox.features_from_polygon(poly, tags=tags)
+        except AttributeError:
+            # Fallback pour les anciennes versions si nécessaire
+            gdf_buildings = ox.geometries_from_polygon(poly, tags=tags)
         
         # Nettoyage des données
         if not gdf_buildings.empty:
@@ -85,6 +93,7 @@ level = st.sidebar.slider("Niveau Administratif (GADM)", 0, 3, 2)
 gdf_base = load_gadm(iso, level)
 
 selected_zone = None
+choice = ""
 if gdf_base is not None:
     col_name = f"NAME_{level}" if level > 0 else "COUNTRY"
     names = sorted(gdf_base[col_name].astype(str).unique())
@@ -146,7 +155,16 @@ if selected_zone is not None:
     # 3. Bâtiments
     if buildings is not None and not buildings.empty:
         # Création d'une colonne type simplifiée pour le style
-        buildings['display_type'] = buildings['amenity'].fillna(buildings['building']).fillna('Bâtiment')
+        # On s'assure que les colonnes existent avant de les utiliser
+        buildings['display_type'] = "Bâtiment"
+        if 'amenity' in buildings.columns:
+            buildings['display_type'] = buildings['amenity'].fillna(buildings.get('building', 'Bâtiment'))
+        elif 'building' in buildings.columns:
+            buildings['display_type'] = buildings['building'].fillna('Bâtiment')
+            
+        # S'assurer que 'name' existe
+        if 'name' not in buildings.columns:
+            buildings['name'] = "Inconnu"
         
         folium.GeoJson(
             buildings,
@@ -173,7 +191,8 @@ if selected_zone is not None:
     # --- Table des données (optionnel) ---
     if st.checkbox("Afficher la liste des infrastructures"):
         if not buildings.empty:
-            st.dataframe(buildings[['name', 'display_type']].dropna(subset=['name']), use_container_width=True)
+            cols_to_show = [c for c in ['name', 'display_type'] if c in buildings.columns]
+            st.dataframe(buildings[cols_to_show].dropna(subset=['name'] if 'name' in buildings.columns else []), use_container_width=True)
         else:
             st.write("Aucune donnée textuelle disponible pour ces bâtiments.")
 
