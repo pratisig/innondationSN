@@ -7,12 +7,14 @@ import osmnx as ox
 from shapely.geometry import shape, mapping
 import json
 import ee
+import pandas as pd
+import plotly.express as px
 from datetime import datetime, timedelta
 
 # ═════════════════════════════════════════════════════════════════
 # 1. CONFIGURATION & INITIALISATION
 # ═════════════════════════════════════════════════════════════════
-st.set_page_config(page_title="FloodWatch WA - Surveillance Inondations", layout="wide")
+st.set_page_config(page_title="FloodWatch WA - Dashboard Impact", layout="wide")
 
 # Paramètres OSMnx
 ox.settings.timeout = 180
@@ -91,6 +93,42 @@ def get_osm_data(_gdf_aoi):
         return gdf_buildings, gdf_routes
     except: return gpd.GeoDataFrame(), gpd.GeoDataFrame()
 
+def get_advanced_stats(aoi_ee, flood_mask):
+    """Calcule population et superficie via GEE"""
+    if not gee_available or flood_mask is None:
+        return {"pop_total": 0, "pop_exposed": 0, "area_ha": 0}
+    
+    try:
+        # 1. Population (WorldPop)
+        pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").filterBounds(aoi_ee).first()
+        
+        pop_total = pop_img.reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=aoi_ee,
+            scale=100
+        ).get('population').getInfo()
+        
+        pop_exposed = pop_img.updateMask(flood_mask).reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=aoi_ee,
+            scale=100
+        ).get('population').getInfo()
+
+        # 2. Superficie Inondée
+        area_m2 = flood_mask.multiply(ee.Image.pixelArea()).reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=aoi_ee,
+            scale=10
+        ).get('flood').getInfo()
+        
+        return {
+            "pop_total": round(pop_total or 0),
+            "pop_exposed": round(pop_exposed or 0),
+            "area_ha": round((area_m2 or 0) / 10000, 2)
+        }
+    except:
+        return {"pop_total": 0, "pop_exposed": 0, "area_ha": 0}
+
 def analyze_impacts(flood_mask, buildings_gdf):
     """Analyse d'impact précise en injectant OSM dans GEE"""
     if flood_mask is None or buildings_gdf.empty: return gpd.GeoDataFrame()
@@ -130,7 +168,6 @@ if mode == "Liste Administrative":
         col = f"NAME_{level}" if level > 0 else "COUNTRY"
         if col in gdf_base.columns:
             choice = st.sidebar.selectbox("Sélectionner la subdivision", sorted(gdf_base[col].dropna().unique()))
-            # Réinitialiser le trigger si la zone change
             new_zone = gdf_base[gdf_base[col] == choice].copy()
             if st.session_state.zone_name != choice:
                 st.session_state.selected_zone = new_zone
@@ -140,7 +177,7 @@ if mode == "Liste Administrative":
             st.sidebar.error(f"Le niveau {level} n'est pas disponible.")
 
 elif mode == "Dessiner sur Carte":
-    st.sidebar.info("Dessinez un polygone sur la carte de prévisualisation.")
+    st.sidebar.info("Dessinez un polygone sur la carte ci-dessous.")
     m_draw = folium.Map(location=[14.5, -14.5], zoom_start=6, tiles="cartodbpositron")
     Draw(export=False, draw_options={'polyline':False, 'circle':False, 'marker':False, 'circlemarker':False}).add_to(m_draw)
     with st.sidebar:
@@ -149,6 +186,7 @@ elif mode == "Dessiner sur Carte":
             geom = shape(out['last_active_drawing']['geometry'])
             st.session_state.selected_zone = gpd.GeoDataFrame(index=[0], crs='epsg:4326', geometry=[geom])
             st.session_state.zone_name = "Zone Dessinée"
+            st.session_state.analysis_triggered = False
 
 elif mode == "Importer Fichier":
     up = st.sidebar.file_uploader("Fichier Géo (GeoJSON, KML)", type=['geojson', 'kml'])
@@ -170,68 +208,109 @@ threshold_val = st.sidebar.slider("Sensibilité (dB)", 2.0, 8.0, 4.0)
 # 4. LOGIQUE PRINCIPALE
 # ═════════════════════════════════════════════════════════════════
 
-st.title(f"🌊 FloodWatch : {st.session_state.zone_name}")
+st.title(f"🌊 FloodWatch Dashboard : {st.session_state.zone_name}")
 
 if st.session_state.selected_zone is not None:
-    if st.button("🚀 LANCER L'ANALYSE D'IMPACT", type="primary", use_container_width=True):
+    if st.button("🚀 ANALYSER L'IMPACT MULTI-SOURCE", type="primary", use_container_width=True):
         st.session_state.analysis_triggered = True
 
     if st.session_state.analysis_triggered:
-        with st.spinner(f"Analyse de {st.session_state.zone_name} en cours..."):
-            # Extraction et Analyse
+        with st.spinner("Calcul des indicateurs avancés (Population, Bâtiments, GEE)..."):
+            # A. Préparation GEE & OSM
             aoi_ee = ee.Geometry(mapping(st.session_state.selected_zone.unary_union))
             buildings, routes = get_osm_data(st.session_state.selected_zone)
             flood_mask = get_flood_mask(aoi_ee, str(start_f), str(end_f), threshold_val)
+            
+            # B. Statistiques Avancées
+            adv_stats = get_advanced_stats(aoi_ee, flood_mask)
             impacted_infra = analyze_impacts(flood_mask, buildings)
             
-            # --- RÉSULTATS ---
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Bâtiments total", len(buildings))
-            m2.metric("⚠️ Impacts détectés", len(impacted_infra))
-            m3.metric("Routes (segments)", len(routes))
+            # --- SECTION 1: INDICATEURS CLÉS ---
+            st.subheader("📊 Indicateurs de Risque")
+            k1, k2, k3, k4 = st.columns(4)
+            
+            with k1:
+                st.metric("Population Totale", f"{adv_stats['pop_total']:,}")
+            with k2:
+                perc_pop = (adv_stats['pop_exposed'] / adv_stats['pop_total'] * 100) if adv_stats['pop_total'] > 0 else 0
+                st.metric("Population Exposée", f"{adv_stats['pop_exposed']:,}", f"{perc_pop:.1f}%", delta_color="inverse")
+            with k3:
+                st.metric("Surface Inondée", f"{adv_stats['area_ha']} ha")
+            with k4:
+                impact_rate = (len(impacted_infra) / len(buildings) * 100) if len(buildings) > 0 else 0
+                st.metric("Infrastructures Impactées", len(impacted_infra), f"{impact_rate:.1f}%", delta_color="inverse")
 
-            # --- CARTE FINALE ---
+            # --- SECTION 2: GRAPHIQUES ---
+            c1, c2 = st.columns([1, 1])
+            
+            with c1:
+                if not impacted_infra.empty:
+                    # Préparation des types de bâtiments
+                    impacted_infra['type_clean'] = impacted_infra.get('amenity', impacted_infra.get('building', 'Inconnu')).fillna('Bâtiment')
+                    type_counts = impacted_infra['type_clean'].value_counts().reset_index()
+                    type_counts.columns = ['Type', 'Nombre']
+                    
+                    fig = px.pie(type_counts, values='Nombre', names='Type', hole=0.5,
+                                 title="Répartition des Bâtiments Impactés",
+                                 color_discrete_sequence=px.colors.sequential.Reds_r)
+                    fig.update_layout(margin=dict(t=40, b=0, l=0, r=0), height=350)
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("Aucun impact infrastructurel détecté.")
+
+            with c2:
+                # Gauge de Dangerosité (basée sur le % de population exposée)
+                fig_gauge = px.bar(x=[perc_pop], y=["Danger"], orientation='h', range_x=[0, 100],
+                                  title="Niveau d'Alerte Population (%)",
+                                  color=[perc_pop], color_continuous_scale="Reds")
+                fig_gauge.update_layout(height=150, margin=dict(t=40, b=0, l=0, r=0), xaxis_title="% Exposé")
+                st.plotly_chart(fig_gauge, use_container_width=True)
+                
+                # Petit tableau résumé des routes
+                st.write(f"🛣️ **Réseau routier :** {len(routes)} segments analysés dans l'emprise.")
+
+            # --- SECTION 3: CARTOGRAPHIE ---
+            st.subheader("🗺️ Visualisation Spatiale")
             center = st.session_state.selected_zone.centroid.iloc[0]
             m = folium.Map(location=[center.y, center.x], zoom_start=13, tiles="cartodbpositron")
             
-            # Couches
             if flood_mask:
                 try:
                     map_id = flood_mask.getMapId({'palette': ['#00bfff']})
                     folium.TileLayer(
                         tiles=map_id['tile_fetcher'].url_format,
-                        attr='GEE', name='Inondation', overlay=True, opacity=0.7
+                        attr='GEE', name='Masque Inondation', overlay=True, opacity=0.7
                     ).add_to(m)
                 except: pass
 
-            folium.GeoJson(st.session_state.selected_zone, name="Zone d'étude", 
+            folium.GeoJson(st.session_state.selected_zone, name="Emprise d'étude", 
                            style_function=lambda x: {'fillColor': 'none', 'color': 'orange', 'weight': 2}).add_to(m)
 
             if not routes.empty:
                 folium.GeoJson(routes, name="Réseau routier", style_function=lambda x: {'color':'#555','weight':1}).add_to(m)
             
             if not impacted_infra.empty:
-                impacted_infra['type'] = impacted_infra.get('amenity', impacted_infra.get('building', 'Inconnu')).fillna('Bâtiment')
                 folium.GeoJson(
                     impacted_infra,
-                    name="Impacts",
+                    name="Impacts Infrastructurels",
                     style_function=lambda x: {'fillColor': 'red', 'color': 'darkred', 'weight': 2, 'fillOpacity': 0.8},
-                    tooltip=folium.GeoJsonTooltip(fields=['type', 'name'], aliases=['Type:', 'Nom:'])
+                    tooltip=folium.GeoJsonTooltip(fields=['type_clean', 'name'], aliases=['Type:', 'Nom:'])
                 ).add_to(m)
 
             folium.LayerControl().add_to(m)
             st_folium(m, width="100%", height=600, key="result_map")
             
             if not impacted_infra.empty:
-                st.subheader("📋 Infrastructures impactées")
-                st.dataframe(impacted_infra[['name', 'type']].dropna(subset=['name']), use_container_width=True)
+                st.subheader("📋 Inventaire des Bâtiments Touchés")
+                st.dataframe(impacted_infra[['name', 'type_clean']].dropna(subset=['name']), use_container_width=True)
     else:
-        # Prévisualisation de la zone sélectionnée
+        # Vue d'attente
         center = st.session_state.selected_zone.centroid.iloc[0]
-        m_pre = folium.Map(location=[center.y, center.x], zoom_start=10, tiles="cartodbpositron")
-        folium.GeoJson(st.session_state.selected_zone, style_function=lambda x: {'color': 'orange'}).add_to(m_pre)
+        m_pre = folium.Map(location=[center.y, center.x], zoom_start=11, tiles="cartodbpositron")
+        folium.GeoJson(st.session_state.selected_zone, style_function=lambda x: {'color': 'orange', 'fillOpacity': 0.1}).add_to(m_pre)
+        st.info("Cliquez sur le bouton ci-dessus pour générer le rapport d'impact complet.")
         st_folium(m_pre, width="100%", height=500, key="pre_view")
 else:
-    st.info("💡 Sélectionnez une zone dans la barre latérale pour débloquer l'analyse.")
+    st.info("💡 Commencez par sélectionner une zone dans la barre latérale.")
     m_default = folium.Map(location=[14.5, -14.5], zoom_start=6, tiles="cartodbpositron")
     st_folium(m_default, width="100%", height=500, key="default_map")
