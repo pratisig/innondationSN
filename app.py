@@ -19,6 +19,10 @@ import ee
 # ═════════════════════════════════════════════════════════════════
 st.set_page_config(page_title="Flood Analysis WA", layout="wide")
 
+# Configuration globale OSMnx pour éviter les blocages
+ox.settings.timeout = 60  # Augmente le timeout à 60 secondes
+ox.settings.use_cache = True
+
 # ────────── INITIALISATION GEE ──────────
 @st.cache_resource
 def init_gee():
@@ -120,31 +124,36 @@ def get_population_exposure(aoi_ee, flood_mask):
 
 @st.cache_data(show_spinner=False)
 def get_osm_data(_gdf_aoi):
-    """Récupère les données OSM pour la zone sélectionnée"""
+    """Récupère les données OSM pour la zone sélectionnée avec des protections contre le gel"""
     if _gdf_aoi is None or _gdf_aoi.empty:
         return gpd.GeoDataFrame()
     
-    # Vérification de la surface pour éviter les plantages
+    # Calcul de la surface pour limiter les abus
     area_sq_km = _gdf_aoi.to_crs(epsg=3857).area.sum() / 1e6
-    if area_sq_km > 1000:
-        st.warning(f"⚠️ Zone trop large ({area_sq_km:.0f} km²) pour le détail OSM. Zoom recommandé.")
+    if area_sq_km > 800: # Seuil réduit pour plus de sécurité
+        st.warning(f"⚠️ Zone trop large ({area_sq_km:.0f} km²) pour l'acquisition OSM temps réel. Veuillez restreindre la zone.")
         return gpd.GeoDataFrame()
 
-    bounds = _gdf_aoi.total_bounds
     try:
+        # On simplifie la géométrie pour accélérer la requête Overpass
+        poly = _gdf_aoi.unary_union
+        if poly.geom_type != 'Polygon':
+            poly = poly.convex_hull # On utilise l'enveloppe convexe si multi-polygone complexe
+
         tags = {
             'building': True, 
             'highway': True, 
             'amenity': ['hospital','school','clinic', 'doctors', 'pharmacy']
         }
-        data = ox.features_from_bbox(
-            bbox=(bounds[3], bounds[1], bounds[2], bounds[0]),
-            tags=tags
-        )
+        
+        # Utilisation de geometries_from_polygon au lieu de features_from_bbox pour être plus précis
+        data = ox.geometries_from_polygon(poly, tags=tags)
+        
         if not data.empty:
             return data.clip(_gdf_aoi)
         return data
     except Exception as e:
+        # En cas d'erreur ou timeout, on renvoie un dataframe vide pour ne pas bloquer l'UI
         return gpd.GeoDataFrame()
 
 # ═════════════════════════════════════════════════════════════════
@@ -225,11 +234,11 @@ if st.button("🚀 LANCER L'ANALYSE", type="primary"):
             if gee_available and flood_mask:
                 total_pop, pop_exposed = get_population_exposure(aoi_ee, flood_mask)
         except Exception as e:
-            st.error(f"Erreur d'initialisation GEE : {e}")
+            st.error(f"Erreur GEE : {e}")
             flood_mask, total_pop, pop_exposed = None, 0, 0
 
     # 2. Préparation OSM
-    with st.spinner("Acquisition des infrastructures..."):
+    with st.spinner("Acquisition des infrastructures (OSM)..."):
         osm_all = get_osm_data(selected_zone)
         n_buildings, n_roads, n_amenities = 0, 0, 0
         if not osm_all.empty:
@@ -275,9 +284,10 @@ if st.button("🚀 LANCER L'ANALYSE", type="primary"):
 
         # Infrastructures
         if not osm_all.empty and 'amenity' in osm_all.columns:
+            # On prend le centroïde pour l'affichage des marqueurs
             points = osm_all[osm_all['amenity'].notna()].centroid
             for idx, pt in points.items():
-                folium.CircleMarker([pt.y, pt.x], radius=3, color='red', fill=True).add_to(m)
+                folium.CircleMarker([pt.y, pt.x], radius=3, color='red', fill=True, popup="Infra").add_to(m)
 
         st_folium(m, width=None, height=550)
 else:
