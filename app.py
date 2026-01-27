@@ -10,11 +10,12 @@ from streamlit_folium import st_folium
 import geopandas as gpd
 import json
 import pandas as pd
-from shapely.geometry import mapping, shape, Polygon, MultiPolygon
+from shapely.geometry import mapping, shape
 from shapely.ops import unary_union
 from pyproj import Geod
 import datetime
 from fpdf import FPDF
+import base64
 import osmnx as ox
 
 # ------------------------------------------------------------
@@ -138,11 +139,6 @@ with st.spinner("Chargement de la zone d'étude..."):
         st.stop()
     gdf = gpd.GeoDataFrame.from_features(aoi_info, crs="EPSG:4326")
     merged_poly = unary_union(gdf.geometry)
-    
-    # Correction OSMnx : convertir GeometryCollection en MultiPolygon si besoin
-    if merged_poly.geom_type == "GeometryCollection":
-        merged_poly = MultiPolygon([g for g in merged_poly.geoms if isinstance(g, Polygon)])
-    
     geom_ee = ee.Geometry(mapping(merged_poly))
 
 # ------------------------------------------------------------
@@ -177,9 +173,12 @@ def get_flood_and_rain(aoi_json, start_str, end_str):
 # ANALYSE D'IMPACT INFRASTRUCTURE (OSMnx)
 # ------------------------------------------------------------
 @st.cache_data
-def analyze_infrastructure_impact_osmnx(flood_img, polygon_shapely):
-    # Convertir la zone inondée en GeoDataFrame pour filtrage local
-    # Extraire bâtiments et routes depuis OSM
+def analyze_infrastructure_impact_osmnx(polygon_geojson):
+    """
+    Télécharge les infrastructures OSM pour un polygone donné.
+    Renvoie deux GeoDataFrames: bâtiments et routes.
+    """
+    polygon_shapely = shape(polygon_geojson)
     try:
         buildings = ox.geometries_from_polygon(polygon_shapely, tags={"building": True})
         roads = ox.geometries_from_polygon(polygon_shapely, tags={"highway": True})
@@ -188,100 +187,86 @@ def analyze_infrastructure_impact_osmnx(flood_img, polygon_shapely):
         st.warning(f"⚠️ Impossible de charger OSM: {e}")
         return gpd.GeoDataFrame(), gpd.GeoDataFrame()
 
+with st.spinner("Analyse des infrastructures OSM..."):
+    buildings_gdf, roads_gdf = analyze_infrastructure_impact_osmnx(mapping(merged_poly))
+
+# Santé et Education
+health_tags = ['hospital', 'clinic', 'doctors', 'pharmacy']
+edu_tags = ['school', 'university', 'kindergarten', 'college']
+
+health_gdf = buildings_gdf[buildings_gdf['amenity'].isin(health_tags)] if not buildings_gdf.empty and 'amenity' in buildings_gdf.columns else gpd.GeoDataFrame()
+edu_gdf = buildings_gdf[buildings_gdf['amenity'].isin(edu_tags)] if not buildings_gdf.empty and 'amenity' in buildings_gdf.columns else gpd.GeoDataFrame()
+
 # ------------------------------------------------------------
-# VISUALISATION & IMPACT
+# ANALYSE & DASHBOARD
 # ------------------------------------------------------------
-if analysis_mode == "Série Temporelle Animée":
-    st.subheader("🎞️ Évolution Temporelle")
-    dates = pd.date_range(start=start_date, end=end_date, freq=f'{interval}D')
-    ts_rows = []
-    images = []
+flood_all, rain_all = get_flood_and_rain(mapping(merged_poly), str(start_date), str(end_date))
+pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").filterBounds(geom_ee).mean().select(0)
 
-    with st.spinner("Calcul de la série temporelle..."):
-        for i in range(len(dates)-1):
-            d1, d2 = str(dates[i].date()), str(dates[i+1].date())
-            f, r = get_flood_and_rain(geom_ee.getInfo(), d1, d2)
-            if f:
-                area_res = safe_get_info(f.multiply(ee.Image.pixelArea()).reduceRegion(ee.Reducer.sum(), geom_ee, 300))
-                area_val = area_res.get('VV', 0) if area_res else 0
-                ts_rows.append({"Date": d1, "Surface (km2)": (area_val/1e6)})
-                images.append(f.visualize(palette=['#00D4FF']))
+features_list = []
+for idx, row in gdf.iterrows():
+    f_geom = row.geometry
+    loc_stats = safe_get_info(ee.Image.cat([
+        flood_all.multiply(ee.Image.pixelArea()).rename('f_area'),
+        pop_img.updateMask(flood_all.select(0)).rename('p_exp')
+    ]).reduceRegion(ee.Reducer.sum(), ee.Geometry(mapping(f_geom)), 250))
 
-        if images:
-            col_a, col_b = st.columns([2, 1])
-            gif_url = ee.ImageCollection(images).getVideoThumbURL({'dimensions': 600, 'region': geom_ee, 'framesPerSecond': 2})
-            col_a.image(gif_url, use_container_width=True)
-            col_b.line_chart(pd.DataFrame(ts_rows).set_index("Date"))
+    f_km2 = (loc_stats.get('f_area', 0) if loc_stats else 0) / 1e6
+    p_exp = (loc_stats.get('p_exp', 0) if loc_stats else 0)
 
-st.subheader("🗺️ Analyse d'Impact Spatiale & Infrastructures")
+    b_count = len(buildings_gdf[buildings_gdf.intersects(f_geom)]) if not buildings_gdf.empty else 0
+    h_count = len(health_gdf[health_gdf.intersects(f_geom)]) if not health_gdf.empty else 0
+    e_count = len(edu_gdf[edu_gdf.intersects(f_geom)]) if not edu_gdf.empty else 0
+    r_count = len(roads_gdf[roads_gdf.intersects(f_geom)]) if not roads_gdf.empty else 0
 
-with st.spinner("Analyse approfondie (Population, GEE et OSM)..."):
-    flood_all, rain_all = get_flood_and_rain(geom_ee.getInfo(), str(start_date), str(end_date))
-    pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").filterBounds(geom_ee).mean().select(0)
+    features_list.append({
+        "Zone": row[label_col],
+        "Inondé (km2)": round(f_km2, 2),
+        "% Inondé": round((f_km2 / get_true_area_km2(f_geom) * 100), 1) if f_km2 > 0 else 0,
+        "Pop. Exposée": int(p_exp),
+        "Bâtiments": int(b_count),
+        "Santé": int(h_count),
+        "Éducation": int(e_count),
+        "Segments Route": int(r_count),
+        "orig_id": idx
+    })
 
-    if flood_all:
-        # Analyse OSMnx
-        buildings_gdf, roads_gdf = analyze_infrastructure_impact_osmnx(flood_all, merged_poly)
-        has_osm = not buildings_gdf.empty and not roads_gdf.empty
+df_res = pd.DataFrame(features_list)
 
-        rain_stats = safe_get_info(rain_all.reduceRegion(ee.Reducer.mean(), geom_ee, 2000))
-        total_rain = rain_stats.get('precip', 0) if rain_stats else 0
-        
-        features_list = []
-        for idx, row in gdf.iterrows():
-            f_geom = ee.Geometry(mapping(row.geometry))
-            
-            # Stats Population & Surface
-            loc_stats = safe_get_info(ee.Image.cat([
-                flood_all.multiply(ee.Image.pixelArea()).rename('f_area'),
-                pop_img.updateMask(flood_all.select(0)).rename('p_exp')
-            ]).reduceRegion(ee.Reducer.sum(), f_geom, 250))
-            
-            f_km2 = (loc_stats.get('f_area', 0) if loc_stats else 0) / 1e6
-            p_exp = (loc_stats.get('p_exp', 0) if loc_stats else 0)
-            
-            # Stats infrastructures OSMnx locales
-            b_count = len(buildings_gdf[buildings_gdf.intersects(row.geometry)]) if has_osm else 0
-            r_count = len(roads_gdf[roads_gdf.intersects(row.geometry)]) if has_osm else 0
-            
-            features_list.append({
-                "Zone": row[label_col],
-                "Inondé (km2)": round(f_km2, 2),
-                "% Inondé": round((f_km2 / get_true_area_km2(row.geometry) * 100), 1) if f_km2 > 0 else 0,
-                "Pop. Exposée": int(p_exp),
-                "Bâtiments": int(b_count) if b_count else 0,
-                "Segments Route": int(r_count) if r_count else 0,
-                "orig_id": idx
-            })
-            
-        df_res = pd.DataFrame(features_list)
+# ------------------------------------------------------------
+# VISUALISATION
+# ------------------------------------------------------------
+m = folium.Map(location=[merged_poly.centroid.y, merged_poly.centroid.x], zoom_start=9, tiles="CartoDB dark_matter")
+if flood_all:
+    mid = flood_all.select(0).getMapId({'palette':['#00D4FF']})
+    folium.TileLayer(tiles=mid['tile_fetcher'].url_format, attr='GEE', name="Zones Inondées", overlay=True).add_to(m)
 
-        m = folium.Map(location=[merged_poly.centroid.y, merged_poly.centroid.x], zoom_start=9, tiles="CartoDB dark_matter")
-        mid = flood_all.select(0).getMapId({'palette':['#00D4FF']})
-        folium.TileLayer(tiles=mid['tile_fetcher'].url_format, attr='GEE', name="Zones Inondées", overlay=True).add_to(m)
+for _, r in df_res.iterrows():
+    geom = gdf.iloc[int(r['orig_id'])].geometry
+    pop_html = f"<b>{r['Zone']}</b><br>Pop Exp: {r['Pop. Exposée']:,}<br>Inondé: {r['Inondé (km2)']} km²"
+    folium.GeoJson(geom, style_function=lambda x: {'fillColor': 'red', 'color': 'white', 'weight': 1, 'fillOpacity': 0.1},
+                   popup=folium.Popup(pop_html, max_width=200)).add_to(m)
 
-        for _, r in df_res.iterrows():
-            geom = gdf.iloc[int(r['orig_id'])].geometry
-            pop_html = f"<b>{r['Zone']}</b><br>Pop Exp: {r['Pop. Exposée']:,}<br>Inondé: {r['Inondé (km2)']} km²"
-            folium.GeoJson(geom, style_function=lambda x: {'fillColor': 'red', 'color': 'white', 'weight': 1, 'fillOpacity': 0.1},
-                           popup=folium.Popup(pop_html, max_width=200)).add_to(m)
+st_folium(m, width="100%", height=500)
 
-        st_folium(m, width="100%", height=500)
+# Dashboard metrics
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Pop. Exposée", f"{df_res['Pop. Exposée'].sum():,}")
+c2.metric("Bâtiments", f"{df_res['Bâtiments'].sum():,}" if not buildings_gdf.empty else "N/A")
+c3.metric("🏥 Santé", f"{df_res['Santé'].sum():,}" if not health_gdf.empty else "N/A")
+c4.metric("🎓 Éducation", f"{df_res['Éducation'].sum():,}" if not edu_gdf.empty else "N/A")
+c5.metric("🛣️ Routes", f"{df_res['Segments Route'].sum():,}" if not roads_gdf.empty else "N/A")
 
-        st.write("---")
-        st.markdown("### 📊 Tableau de Bord des Dommages")
-        
-        c1, c2, c5 = st.columns(3)
-        c1.metric("Pop. Exposée", f"{df_res['Pop. Exposée'].sum():,}")
-        c2.metric("Bâtiments", f"{df_res['Bâtiments'].sum():,}" if has_osm else "N/A")
-        c5.metric("🛣️ Routes", f"{df_res['Segments Route'].sum():,}" if has_osm else "N/A")
+# Export PDF
+st.sidebar.header("3️⃣ Export")
+pdf_b = create_pdf_report(df_res.rename(columns={'Bâtiments': 'Bâtiments Affectés', 'Segments Route': 'Routes Affectées'}), country_name, start_date, end_date, {
+    'area': df_res['Inondé (km2)'].sum(), 
+    'pop': df_res['Pop. Exposée'].sum(),
+    'buildings': df_res['Bâtiments'].sum(), 
+    'roads': df_res['Segments Route'].sum(),
+    'rain': safe_get_info(rain_all.reduceRegion(ee.Reducer.mean(), geom_ee, 2000)).get('precip',0) if rain_all else 0
+})
+st.sidebar.download_button("📄 Télécharger Rapport Décisionnel", pdf_b, "rapport_impact.pdf")
 
-        st.sidebar.header("3️⃣ Export")
-        pdf_b = create_pdf_report(df_res.rename(columns={'Bâtiments': 'Bâtiments Affectés', 'Segments Route': 'Routes Affectées'}), country_name, start_date, end_date, {
-            'area': df_res['Inondé (km2)'].sum(), 'pop': df_res['Pop. Exposée'].sum(),
-            'buildings': df_res['Bâtiments'].sum(), 'roads': df_res['Segments Route'].sum(), 'rain': total_rain
-        })
-        st.sidebar.download_button("📄 Télécharger Rapport Décisionnel", pdf_b, "rapport_impact.pdf")
-
-if 'df_res' in locals():
-    st.dataframe(df_res.drop(columns=['orig_id']), use_container_width=True)
+# Tableau de données
+st.dataframe(df_res.drop(columns=['orig_id']), use_container_width=True)
