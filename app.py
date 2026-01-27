@@ -45,6 +45,8 @@ def load_gadm(iso, level):
         gdf = gpd.read_file(url, layer=level)
         return gdf.to_crs(epsg=4326)
     except Exception:
+        # Fallback si le niveau demandé n'existe pas pour ce pays
+        st.sidebar.warning(f"Le niveau {level} n'est peut-être pas disponible pour ce pays.")
         return None
 
 def get_flood_mask(aoi_ee, start_flood, end_flood, threshold=4.0):
@@ -84,7 +86,11 @@ def get_osm_data(_gdf_aoi):
         
         # Bâtiments & Infrastructures
         tags = {'building': True, 'amenity': True, 'healthcare': True, 'education': True}
-        gdf_buildings = ox.features_from_polygon(poly, tags=tags)
+        try:
+            gdf_buildings = ox.features_from_polygon(poly, tags=tags)
+        except AttributeError:
+            gdf_buildings = ox.geometries_from_polygon(poly, tags=tags)
+            
         gdf_buildings = gdf_buildings[gdf_buildings.geometry.type.isin(['Polygon', 'MultiPolygon'])]
         gdf_buildings = gdf_buildings.reset_index().clip(_gdf_aoi)
         
@@ -95,7 +101,7 @@ def analyze_impacts(flood_mask, buildings_gdf):
     """Analyse d'impact précise en injectant OSM dans GEE"""
     if flood_mask is None or buildings_gdf.empty: return gpd.GeoDataFrame()
     try:
-        # On limite pour éviter les timeouts (batch de 1000)
+        # On limite pour éviter les timeouts (batch de 1500)
         infra_check = buildings_gdf.head(1500).copy()
         features = []
         for i, row in infra_check.iterrows():
@@ -110,34 +116,56 @@ def analyze_impacts(flood_mask, buildings_gdf):
     except: return gpd.GeoDataFrame()
 
 # ═════════════════════════════════════════════════════════════════
-# 3. INTERFACE UTILISATEUR
+# 3. INTERFACE UTILISATEUR (SIDEBAR)
 # ═════════════════════════════════════════════════════════════════
 
 st.sidebar.header("🗺️ 1. Zone d'Étude")
 mode = st.sidebar.radio("Méthode de sélection :", ["Liste Administrative", "Dessiner sur Carte", "Importer Fichier"])
 
-selected_zone = None
-zone_name = "Zone personnalisée"
+# Initialisation des variables d'état pour la zone
+if 'selected_zone' not in st.session_state:
+    st.session_state.selected_zone = None
+if 'zone_name' not in st.session_state:
+    st.session_state.zone_name = "Zone personnalisée"
 
 if mode == "Liste Administrative":
     countries = {"Sénégal": "SEN", "Mali": "MLI", "Niger": "NER", "Burkina Faso": "BFA"}
     c_choice = st.sidebar.selectbox("Pays", list(countries.keys()))
-    level = st.sidebar.slider("Niveau Admin", 0, 3, 2)
+    # Augmentation du niveau max à 5 pour une précision maximale (GADM va souvent jusqu'à 4 ou 5)
+    level = st.sidebar.slider("Niveau Admin (Max pour précision)", 0, 5, 2)
     gdf_base = load_gadm(countries[c_choice], level)
     if gdf_base is not None:
         col = f"NAME_{level}" if level > 0 else "COUNTRY"
-        choice = st.sidebar.selectbox("Région/Cercle", sorted(gdf_base[col].unique()))
-        selected_zone = gdf_base[gdf_base[col] == choice].copy()
-        zone_name = choice
+        # On vérifie que la colonne existe dans le GDF chargé
+        if col in gdf_base.columns:
+            choice = st.sidebar.selectbox("Sélectionner la subdivision", sorted(gdf_base[col].dropna().unique()))
+            st.session_state.selected_zone = gdf_base[gdf_base[col] == choice].copy()
+            st.session_state.zone_name = choice
+        else:
+            st.sidebar.error(f"Le niveau {level} n'est pas disponible pour ce pays.")
 
 elif mode == "Dessiner sur Carte":
-    st.sidebar.info("Dessinez un polygone sur la carte de droite.")
+    st.sidebar.info("Dessinez un polygone sur la carte de prévisualisation ci-dessous.")
+    # Carte de dessin intégrée en sidebar ou au-dessus du bouton
+    m_draw = folium.Map(location=[14.5, -14.5], zoom_start=6, tiles="cartodbpositron")
+    Draw(export=False, draw_options={'polyline':False, 'circle':False, 'marker':False, 'circlemarker':False}).add_to(m_draw)
     
+    # On affiche la carte de dessin dans la sidebar ou en haut du main
+    with st.sidebar:
+        out = st_folium(m_draw, width=250, height=250, key="draw_sidebar")
+        if out and out.get('last_active_drawing'):
+            geom = shape(out['last_active_drawing']['geometry'])
+            st.session_state.selected_zone = gpd.GeoDataFrame(index=[0], crs='epsg:4326', geometry=[geom])
+            st.session_state.zone_name = "Zone Dessinée"
+
 elif mode == "Importer Fichier":
-    up = st.sidebar.file_uploader("Fichier Géo", type=['geojson', 'kml'])
+    up = st.sidebar.file_uploader("Fichier Géo (GeoJSON, KML)", type=['geojson', 'kml'])
     if up: 
-        selected_zone = gpd.read_file(up).to_crs(epsg=4326)
-        zone_name = "Zone Importée"
+        try:
+            st.session_state.selected_zone = gpd.read_file(up).to_crs(epsg:4326)
+            st.session_state.zone_name = "Zone Importée"
+        except:
+            st.sidebar.error("Erreur lors de la lecture du fichier.")
 
 st.sidebar.header("📅 2. Période d'Analyse")
 col_d1, col_d2 = st.sidebar.columns(2)
@@ -149,25 +177,17 @@ threshold_val = st.sidebar.slider("Sensibilité détection (dB)", 2.0, 8.0, 4.0)
 # 4. LOGIQUE PRINCIPALE
 # ═════════════════════════════════════════════════════════════════
 
-st.title(f"🌊 FloodWatch : {zone_name}")
+st.title(f"🌊 FloodWatch : {st.session_state.zone_name}")
 
-if mode == "Dessiner sur Carte" and selected_zone is None:
-    m_draw = folium.Map(location=[14.5, -14.5], zoom_start=6, tiles="cartodbpositron")
-    Draw(export=False, draw_options={'polyline':False, 'circle':False, 'marker':False, 'circlemarker':False}).add_to(m_draw)
-    out = st_folium(m_draw, width="100%", height=400, key="draw")
-    if out and out.get('last_active_drawing'):
-        geom = shape(out['last_active_drawing']['geometry'])
-        selected_zone = gpd.GeoDataFrame(index=[0], crs='epsg:4326', geometry=[geom])
-        st.rerun()
-
-if selected_zone is not None:
-    if st.button("🚀 LANCER L'ANALYSE D'IMPACT", type="primary"):
-        with st.spinner("Analyse spatiale en cours (Sentinel-1 + OSM + GEE)..."):
+if st.session_state.selected_zone is not None:
+    # Le bouton est maintenant toujours affiché si une zone existe
+    if st.button("🚀 LANCER L'ANALYSE D'IMPACT", type="primary", use_container_width=True):
+        with st.spinner(f"Analyse spatiale de {st.session_state.zone_name} en cours..."):
             # A. Préparation GEE
-            aoi_ee = ee.Geometry(mapping(selected_zone.unary_union))
+            aoi_ee = ee.Geometry(mapping(st.session_state.selected_zone.unary_union))
             
             # B. Extraction OSM
-            buildings, routes = get_osm_data(selected_zone)
+            buildings, routes = get_osm_data(st.session_state.selected_zone)
             
             # C. Masque Inondation
             flood_mask = get_flood_mask(aoi_ee, str(start_f), str(end_f), threshold_val)
@@ -182,7 +202,7 @@ if selected_zone is not None:
             m3.metric("Réseau routier (seg.)", len(routes))
 
             # --- CARTE FINALE ---
-            center = selected_zone.centroid.iloc[0]
+            center = st.session_state.selected_zone.centroid.iloc[0]
             m = folium.Map(location=[center.y, center.x], zoom_start=13, tiles="cartodbpositron")
             
             # Couche Inondation (GEE)
@@ -197,8 +217,13 @@ if selected_zone is not None:
                     ).add_to(m)
                 except: pass
 
+            # Couche Emprise Zone
+            folium.GeoJson(st.session_state.selected_zone, name="Zone d'étude", 
+                           style_function=lambda x: {'fillColor': 'none', 'color': 'orange', 'weight': 2}).add_to(m)
+
             # Couche Routes
-            folium.GeoJson(routes, name="Réseau routier", style_function=lambda x: {'color':'#555','weight':1}).add_to(m)
+            if not routes.empty:
+                folium.GeoJson(routes, name="Réseau routier", style_function=lambda x: {'color':'#555','weight':1}).add_to(m)
             
             # Couche Infrastructures Impactées
             if not impacted_infra.empty:
@@ -216,6 +241,9 @@ if selected_zone is not None:
             if not impacted_infra.empty:
                 st.subheader("📋 Liste des infrastructures impactées")
                 st.dataframe(impacted_infra[['name', 'type']].dropna(subset=['name']), use_container_width=True)
-
 else:
-    st.info("Sélectionnez une zone dans la barre latérale pour commencer l'analyse.")
+    st.info("💡 Sélectionnez une zone dans la barre latérale (via GADM, dessin ou import) pour débloquer l'analyse.")
+    
+    # Affichage d'une carte vide par défaut si rien n'est sélectionné
+    m_preview = folium.Map(location=[14.5, -14.5], zoom_start=6, tiles="cartodbpositron")
+    st_folium(m_preview, width="100%", height=500, key="preview_map")
