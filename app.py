@@ -54,34 +54,92 @@ def load_gadm(iso, level):
     except Exception:
         return None
 
-def get_flood_mask(aoi_ee, start_flood, end_flood, threshold=4.0):
+def advanced_flood_detection(aoi, ref_start, ref_end, flood_start, flood_end, threshold_db=0.75, min_pixels=8):
+    """
+    Détection inondation AVEC masques explicites pour réduire les surestimations.
+    """
     if not gee_available: return None
+    
     try:
-        s1_col = (ee.ImageCollection("COPERNICUS/S1_GRD")
-                  .filterBounds(aoi_ee)
+        # ÉTAPE 0: Images RÉFÉRENCE (période sèche)
+        s1_ref = (ee.ImageCollection("COPERNICUS/S1_GRD")
+                  .filterBounds(aoi)
+                  .filterDate(ref_start, ref_end)
                   .filter(ee.Filter.eq("instrumentMode", "IW"))
                   .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
-                  .filterDate(start_flood, end_flood)
-                  .select('VV'))
+                  .select("VV")
+                  .median())
         
-        img_flood = s1_col.min().clip(aoi_ee).focal_median(50, 'circle', 'meters')
-        img_ref = (ee.ImageCollection("COPERNICUS/S1_GRD")
-                   .filterBounds(aoi_ee)
-                   .filterDate("2023-01-01", "2023-04-30")
-                   .select('VV').median().clip(aoi_ee).focal_median(50, 'circle', 'meters'))
-
-        diff = img_ref.subtract(img_flood)
-        flood_raw = diff.gt(threshold)
-
-        permanent_water = ee.Image("JRC/GSW1_4/GlobalSurfaceWater").select('occurrence')
-        water_mask = permanent_water.gt(80).clip(aoi_ee)
+        # Convertir en dB (gestion des valeurs nulles)
+        ref_db = ee.Image(10).multiply(s1_ref.max(ee.Image(0.0001)).log10())
         
-        final_flood = flood_raw.where(water_mask, 0).selfMask()
-        return final_flood.rename('flood')
-    except: return None
+        # ÉTAPE 1: Image CRISE (période inondation)
+        s1_crisis = (ee.ImageCollection("COPERNICUS/S1_GRD")
+                     .filterBounds(aoi)
+                     .filterDate(flood_start, flood_end)
+                     .filter(ee.Filter.eq("instrumentMode", "IW"))
+                     .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+                     .select("VV")
+                     .median())
+        
+        crisis_db = ee.Image(10).multiply(s1_crisis.max(ee.Image(0.0001)).log10())
+        
+        # ÉTAPE 2: CALCUL ANOMALIE BACKSCATTER
+        delta_db = ref_db.subtract(crisis_db)
+        flood_raw = delta_db.gt(threshold_db).rename('flood')
+        
+        # ÉTAPE 3: MASQUE "EAU EXISTANTE" (MODIS NDWI)
+        modis_ref = (ee.ImageCollection("MODIS/006/MOD09GA")
+                     .filterBounds(aoi)
+                     .filterDate(ref_start, ref_end)
+                     .median())
+        
+        nir = modis_ref.select('sur_refl_b02')
+        swir = modis_ref.select('sur_refl_b06')
+        ndwi_ref = nir.subtract(swir).divide(nir.add(swir))
+        mask_not_existing_water = ndwi_ref.lt(0.3)
+        
+        flood_no_water = flood_raw.updateMask(mask_not_existing_water)
+        
+        # ÉTAPE 4: MASQUE "ZONES URBAINES DENSES" (NDBI)
+        modis_crisis = (ee.ImageCollection("MODIS/006/MOD09GA")
+                        .filterBounds(aoi)
+                        .filterDate(flood_start, flood_end)
+                        .median())
+        
+        nir_c = modis_crisis.select('sur_refl_b02')
+        swir_c = modis_crisis.select('sur_refl_b06')
+        ndbi = swir_c.subtract(nir_c).divide(swir_c.add(nir_c))
+        mask_not_urban = ndbi.lt(0.1)
+        
+        flood_no_urban = flood_no_water.updateMask(mask_not_urban)
+        
+        # ÉTAPE 5: MASQUE "PENTE" (SRTM)
+        dem = ee.Image("USGS/SRTMGL1_003")
+        slope = ee.Algorithms.Terrain(dem).select("slope")
+        mask_low_slope = slope.lt(5)
+        
+        flood_low_slope = flood_no_urban.updateMask(mask_low_slope)
+        
+        # ÉTAPE 6: FILTRE CONNECTIVITÉ (anti-bruit)
+        connected_pixels = flood_low_slope.connectedPixelCount(8)
+        flood_connected = flood_low_slope.updateMask(connected_pixels.gte(min_pixels))
+        
+        return {
+            'flood_final': flood_connected.selfMask(),
+            'stages': {
+                'Brut': flood_raw,
+                'Sans Eau Existante': flood_no_water,
+                'Sans Urbain': flood_no_urban,
+                'Pente Basse': flood_low_slope,
+                'Final (Connecté)': flood_connected
+            }
+        }
+    except Exception as e:
+        st.error(f"Erreur GEE : {str(e)}")
+        return None
 
 def get_climate_data(aoi_ee, start_date, end_date):
-    """Récupère le cumul de pluie (CHIRPS) et la température (ERA5)"""
     if not gee_available: return None
     try:
         precip = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY") \
@@ -194,11 +252,12 @@ if mode == "Liste Administrative":
     gdf_base = load_gadm(countries[c_choice], level)
     if gdf_base is not None:
         col = f"NAME_{level}" if level > 0 else "COUNTRY"
-        choice = st.sidebar.selectbox("Subdivision", sorted(gdf_base[col].dropna().unique()))
-        new_zone = gdf_base[gdf_base[col] == choice].copy()
-        if st.session_state.zone_name != choice:
+        # Sélection multiple
+        choices = st.sidebar.multiselect("Subdivisions", sorted(gdf_base[col].dropna().unique()))
+        if choices:
+            new_zone = gdf_base[gdf_base[col].isin(choices)].copy()
             st.session_state.selected_zone = new_zone
-            st.session_state.zone_name = choice
+            st.session_state.zone_name = ", ".join(choices)
             st.session_state.analysis_triggered = False
 
 elif mode == "Dessiner sur Carte":
@@ -213,9 +272,15 @@ elif mode == "Dessiner sur Carte":
             st.session_state.analysis_triggered = False
 
 st.sidebar.markdown("## 📅 2. Paramètres")
-start_f = st.sidebar.date_input("Début période", datetime(2024, 8, 1))
-end_f = st.sidebar.date_input("Fin période", datetime(2024, 9, 30))
-threshold_val = st.sidebar.slider("Seuil radar (dB)", 2.0, 8.0, 4.0)
+ref_start = st.sidebar.date_input("Réf. (Sèche)", datetime(2023, 1, 1))
+ref_end = st.sidebar.date_input("Réf. (Fin)", datetime(2023, 4, 30))
+st.sidebar.divider()
+start_f = st.sidebar.date_input("Inond. Début", datetime(2024, 8, 1))
+end_f = st.sidebar.date_input("Inond. Fin", datetime(2024, 9, 30))
+threshold_val = st.sidebar.slider("Seuil Diff (dB)", 0.5, 5.0, 0.75, step=0.25)
+min_pix = st.sidebar.number_input("Taille min amas (pixels)", 1, 50, 8)
+
+show_diagnostic = st.sidebar.checkbox("Mode Diagnostic (Masques)", value=False)
 
 # ═════════════════════════════════════════════════════════════════
 # 4. LOGIQUE PRINCIPALE
@@ -228,134 +293,114 @@ if st.session_state.selected_zone is not None:
         st.session_state.analysis_triggered = True
 
     if st.session_state.analysis_triggered:
-        with st.spinner("Analyse multicritère en cours (Climat, Population, Infrastructures)..."):
-            # A. GEE
+        with st.spinner("Analyse avancée GEE (Masquage Urbain, Pente, NDWI)..."):
+            # A. GEE - Détection Avancée
             aoi_ee_global = ee.Geometry(mapping(st.session_state.selected_zone.unary_union))
-            flood_mask = get_flood_mask(aoi_ee_global, str(start_f), str(end_f), threshold_val)
-            df_climat = get_climate_data(aoi_ee_global, str(start_f), str(end_f))
+            flood_data = advanced_flood_detection(
+                aoi_ee_global, 
+                str(ref_start), str(ref_end), 
+                str(start_f), str(end_f), 
+                threshold_val, min_pix
+            )
             
-            # B. OSM & Impacts
-            buildings, routes = get_osm_data(st.session_state.selected_zone)
-            impacted_infra = analyze_impacted_infra(flood_mask, buildings)
-            impacted_roads = analyze_impacted_roads(flood_mask, routes)
-            
-            # C. Population et Superficie par subdivision
-            sector_data = []
-            total_pop_all = 0
-            total_pop_exposed = 0
-            total_flood_ha = 0
-            
-            for idx, row in st.session_state.selected_zone.iterrows():
-                geom_ee = ee.Geometry(mapping(row.geometry))
-                t_pop, e_pop = get_population_stats(geom_ee, flood_mask)
-                f_area = get_area_stats(geom_ee, flood_mask)
+            if flood_data:
+                flood_mask = flood_data['flood_final']
+                df_climat = get_climate_data(aoi_ee_global, str(start_f), str(end_f))
                 
-                total_pop_all += t_pop
-                total_pop_exposed += e_pop
-                total_flood_ha += f_area
+                # B. OSM & Impacts
+                buildings, routes = get_osm_data(st.session_state.selected_zone)
+                impacted_infra = analyze_impacted_infra(flood_mask, buildings)
+                impacted_roads = analyze_impacted_roads(flood_mask, routes)
                 
-                sector_data.append({
-                    'Secteur': row.get('NAME_2', row.get('NAME_1', st.session_state.zone_name)),
-                    'Pop. Totale': t_pop,
-                    'Pop. Exposée': e_pop,
-                    '% Impacté': f"{(e_pop/t_pop*100):.1f}%" if t_pop > 0 else "0%",
-                    'Inondation (ha)': round(f_area, 2)
-                })
-            
-            # --- SECTION 1: BILAN IMPACT POPULATION & INDICATEURS ---
-            st.markdown("### 📊 Indicateurs de Risque et d'Impact")
-            p1, p2, p3, p4 = st.columns(4)
-            with p1:
-                st.markdown(f"**🏠 Population Totale**\n## {total_pop_all:,}")
-            with p2:
-                color = "red" if total_pop_exposed > 0 else "gray"
-                perc = (total_pop_exposed / total_pop_all * 100) if total_pop_all > 0 else 0
-                st.markdown(f"**⚠️ Population Sinistrée**\n<h2 style='color:{color}'>{total_pop_exposed:,} <span style='font-size: 16px; font-weight: normal; color: #555;'>( {perc:.1f}% )</span></h2>", unsafe_allow_html=True)
-            with p3:
-                st.markdown(f"**🌊 Zone Inondée**\n## {total_flood_ha:.2f} ha")
-            with p4:
-                # Calcul rapide du cumul de pluie si disponible
-                rain_sum = df_climat['value_precip'].sum() if df_climat is not None else 0
-                st.markdown(f"**🌧️ Cumul Pluie**\n## {rain_sum:.1f} mm")
+                # C. Population et Superficie par subdivision
+                sector_data = []
+                total_pop_all = 0
+                total_pop_exposed = 0
+                total_flood_ha = 0
+                
+                for idx, row in st.session_state.selected_zone.iterrows():
+                    geom_ee = ee.Geometry(mapping(row.geometry))
+                    t_pop, e_pop = get_population_stats(geom_ee, flood_mask)
+                    f_area = get_area_stats(geom_ee, flood_mask)
+                    
+                    total_pop_all += t_pop
+                    total_pop_exposed += e_pop
+                    total_flood_ha += f_area
+                    
+                    sector_name = row.get('NAME_2', row.get('NAME_1', row.get('NAME_0', f"Zone {idx}")))
+                    sector_data.append({
+                        'Secteur': sector_name,
+                        'Pop. Totale': t_pop,
+                        'Pop. Exposée': e_pop,
+                        '% Impacté': f"{(e_pop/t_pop*100):.1f}%" if t_pop > 0 else "N/A",
+                        'Inondation (ha)': round(f_area, 2)
+                    })
+                
+                # --- SECTION 1: BILAN ---
+                st.markdown("### 📊 Indicateurs de Risque Précis")
+                p1, p2, p3, p4 = st.columns(4)
+                with p1:
+                    st.markdown(f"**🏠 Population Totale**\n## {total_pop_all:,}")
+                with p2:
+                    color = "red" if total_pop_exposed > 0 else "gray"
+                    perc = (total_pop_exposed / total_pop_all * 100) if total_pop_all > 0 else 0
+                    st.markdown(f"**⚠️ Population Sinistrée**\n<h2 style='color:{color}'>{total_pop_exposed:,} <span style='font-size: 16px; font-weight: normal; color: #555;'>( {perc:.1f}% )</span></h2>", unsafe_allow_html=True)
+                with p3:
+                    st.markdown(f"**🌊 Zone Inondée**\n## {total_flood_ha:.2f} ha")
+                with p4:
+                    rain_sum = df_climat['value_precip'].sum() if df_climat is not None else 0
+                    st.markdown(f"**🌧️ Cumul Pluie**\n## {rain_sum:.1f} mm")
 
-            # --- SECTION 2: CARTE & INFRA ---
-            col_map, col_stats = st.columns([2, 1])
-            with col_map:
-                st.markdown("#### 🗺️ Cartographie des Dégâts")
-                center = st.session_state.selected_zone.centroid.iloc[0]
-                m = folium.Map(location=[center.y, center.x], zoom_start=12, tiles="cartodbpositron")
-                
-                # Ajout des polygones de la zone sélectionnée
-                folium.GeoJson(
-                    st.session_state.selected_zone,
-                    name="Zone d'Étude",
-                    style_function=lambda x: {
-                        'fillColor': '#f0f0f0',
-                        'color': 'black',
-                        'weight': 2,
-                        'fillOpacity': 0.1
-                    }
-                ).add_to(m)
+                # --- SECTION 2: CARTE & INFRA ---
+                col_map, col_stats = st.columns([2, 1])
+                with col_map:
+                    st.markdown("#### 🗺️ Cartographie des Dégâts")
+                    center = st.session_state.selected_zone.centroid.iloc[0]
+                    m = folium.Map(location=[center.y, center.x], zoom_start=12, tiles="cartodbpositron")
+                    
+                    folium.GeoJson(st.session_state.selected_zone, name="Zone d'Étude", style_function=lambda x: {'fillColor': '#f0f0f0','color': 'black','weight': 2,'fillOpacity': 0.1}).add_to(m)
 
-                if flood_mask:
-                    map_id = flood_mask.getMapId({'palette': ['#00bfff']})
-                    folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name='Inondations').add_to(m)
-                
-                if not impacted_roads.empty:
-                    folium.GeoJson(impacted_roads, name="Routes Coupées", style_function=lambda x: {'color': 'red', 'weight': 4}).add_to(m)
-                
-                if not impacted_infra.empty:
-                    folium.GeoJson(impacted_infra, name="Bâtiments Touchés", style_function=lambda x: {'fillColor': 'red', 'color': 'darkred', 'weight': 1, 'fillOpacity': 0.7}).add_to(m)
-                
-                folium.LayerControl().add_to(m)
-                st_folium(m, width="100%", height=500, key="map_res")
+                    if show_diagnostic:
+                        for stage_name, stage_img in flood_data['stages'].items():
+                            map_id = stage_img.getMapId({'min':0, 'max':1, 'palette': ['white', 'blue'] if 'Final' in stage_name else ['white', 'orange']})
+                            folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name=f"Diagnostic: {stage_name}", overlay=True, show=False).add_to(m)
+                    
+                    if flood_mask:
+                        map_id = flood_mask.getMapId({'palette': ['#00bfff']})
+                        folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name='Inondations Finales', overlay=True).add_to(m)
+                    
+                    if not impacted_roads.empty:
+                        folium.GeoJson(impacted_roads, name="Routes Coupées", style_function=lambda x: {'color': 'red', 'weight': 4}).add_to(m)
+                    
+                    if not impacted_infra.empty:
+                        folium.GeoJson(impacted_infra, name="Bâtiments Touchés", style_function=lambda x: {'fillColor': 'red', 'color': 'darkred', 'weight': 1, 'fillOpacity': 0.7}).add_to(m)
+                    
+                    folium.LayerControl().add_to(m)
+                    st_folium(m, width="100%", height=500, key="map_res")
 
-            with col_stats:
-                st.markdown("#### 🏗️ Infrastructures")
-                st.metric("Routes impactées", f"{len(impacted_roads)} seg.")
-                st.metric("Bâtiments touchés", f"{len(impacted_infra)}")
-                
-                if not impacted_infra.empty:
-                    def translate_type(row):
-                        t = str(row.get('amenity', row.get('building', 'Autre'))).lower()
-                        if any(x in t for x in ['school', 'university', 'college']): return "🏫 Écoles"
-                        if any(x in t for x in ['hospital', 'clinic', 'health']): return "🏥 Santé"
-                        return "🏠 Habitat"
-                    impacted_infra['Cat'] = impacted_infra.apply(translate_type, axis=1)
-                    st.plotly_chart(px.pie(impacted_infra, names='Cat', hole=0.4, title="Répartition des bât. impactés"), use_container_width=True)
+                with col_stats:
+                    st.markdown("#### 🏗️ Infrastructures")
+                    st.metric("Routes impactées", f"{len(impacted_roads)} seg.")
+                    st.metric("Bâtiments touchés", f"{len(impacted_infra)}")
+                    
+                    if not impacted_infra.empty:
+                        def translate_type(row):
+                            t = str(row.get('amenity', row.get('building', 'Autre'))).lower()
+                            if any(x in t for x in ['school', 'university', 'college']): return "🏫 Écoles"
+                            if any(x in t for x in ['hospital', 'clinic', 'health']): return "🏥 Santé"
+                            return "🏠 Habitat"
+                        impacted_infra['Cat'] = impacted_infra.apply(translate_type, axis=1)
+                        st.plotly_chart(px.pie(impacted_infra, names='Cat', hole=0.4, title="Bâtiments impactés"), use_container_width=True)
 
-            # --- SECTION 3: CLIMAT (DÉPLACÉ SOUS LA CARTE) ---
-            st.markdown("### ☁️ Suivi Climatique & Précipitations")
-            if df_climat is not None:
-                fig_clim = go.Figure()
-                fig_clim.add_trace(go.Bar(x=df_climat['date'], y=df_climat['value_precip'], name="Pluie (mm)", marker_color='royalblue'))
-                fig_clim.add_trace(go.Scatter(x=df_climat['date'], y=df_climat['value_temp'], name="Température (°C)", yaxis='y2', line=dict(color='orange', width=3)))
-                
-                fig_clim.update_layout(
-                    title="Diagramme Ombrothermique (Précipitations et Température)",
-                    yaxis=dict(title="Précipitations (mm)"),
-                    yaxis2=dict(title="Température (°C)", overlaying='y', side='right'),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                )
-                st.plotly_chart(fig_clim, use_container_width=True)
-            
-            # --- SECTION 4: TABLEAU DE SYNTHÈSE ---
-            st.markdown("### 📋 Synthèse détaillée par Secteur")
-            st.table(pd.DataFrame(sector_data))
-
-            # --- SECTION 5: EXPORTATION ---
-            st.divider()
-            st.markdown("### 📥 Exportation des Données")
-            ex1, ex2, ex3 = st.columns(3)
-            
-            # Export CSV des impacts consolidés
-            df_impact = pd.DataFrame(sector_data)
-            
-            with ex1:
-                st.download_button("📊 Export Rapport (CSV)", df_impact.to_csv(index=False), "rapport_impact_secteurs.csv", "text/csv")
-            with ex2:
-                if not impacted_infra.empty:
-                    st.download_button("🏘️ Bâtiments Impactés (GeoJSON)", impacted_infra.to_json(), "batiments_impact.geojson", "application/json")
-            with ex3:
+                # --- SECTION 3: CLIMAT ---
+                st.markdown("### ☁️ Suivi Climatique")
                 if df_climat is not None:
-                    st.download_button("🌡️ Données Climatiques (CSV)", df_climat.to_csv(index=False), "donnees_climat.csv", "text/csv")
+                    fig_clim = go.Figure()
+                    fig_clim.add_trace(go.Bar(x=df_climat['date'], y=df_climat['value_precip'], name="Pluie (mm)", marker_color='royalblue'))
+                    fig_clim.add_trace(go.Scatter(x=df_climat['date'], y=df_climat['value_temp'], name="Température (°C)", yaxis='y2', line=dict(color='orange', width=3)))
+                    fig_clim.update_layout(yaxis=dict(title="Pluie (mm)"), yaxis2=dict(title="Temp (°C)", overlaying='y', side='right'), legend=dict(orientation="h"))
+                    st.plotly_chart(fig_clim, use_container_width=True)
+                
+                # --- SECTION 4: SYNTHÈSE ---
+                st.markdown("### 📋 Synthèse par Secteur")
+                st.dataframe(pd.DataFrame(sector_data), use_container_width=True)
