@@ -46,12 +46,10 @@ def get_osm_data(_gdf_aoi):
         poly = _gdf_aoi.unary_union
         
         # 1. Récupération des routes
-        # Utilisation de graph_from_polygon pour obtenir le réseau routier
         graph = ox.graph_from_polygon(poly, network_type='all', simplify=True)
         gdf_routes = ox.graph_to_gdfs(graph, nodes=False, edges=True)
         
         # 2. Récupération des bâtiments et équipements
-        # Correction : geometries_from_polygon est devenu features_from_polygon dans les versions récentes
         tags = {
             'building': True, 
             'amenity': True,
@@ -60,19 +58,21 @@ def get_osm_data(_gdf_aoi):
         }
         
         try:
-            # Essayer la nouvelle API (v1.3.0+)
             gdf_buildings = ox.features_from_polygon(poly, tags=tags)
         except AttributeError:
-            # Fallback pour les anciennes versions si nécessaire
             gdf_buildings = ox.geometries_from_polygon(poly, tags=tags)
         
-        # Nettoyage des données
+        # Nettoyage et simplification des données pour Folium
         if not gdf_buildings.empty:
+            # On ne garde que les polygones et on réinitialise l'index MultiIndex d'OSM
             gdf_buildings = gdf_buildings[gdf_buildings.geometry.type.isin(['Polygon', 'MultiPolygon'])]
-            gdf_buildings = gdf_buildings.clip(_gdf_aoi).reset_index(drop=True)
+            gdf_buildings = gdf_buildings.reset_index()
+            gdf_buildings = gdf_buildings.clip(_gdf_aoi)
             
         if not gdf_routes.empty:
-            gdf_routes = gdf_routes.clip(_gdf_aoi).reset_index(drop=True)
+            # Réinitialisation de l'index pour les routes également
+            gdf_routes = gdf_routes.reset_index()
+            gdf_routes = gdf_routes.clip(_gdf_aoi)
             
         return gdf_buildings, gdf_routes
     except Exception as e:
@@ -126,54 +126,54 @@ if selected_zone is not None:
 
     # --- Carte ---
     center = selected_zone.centroid.iloc[0]
+    # Utilisation de CartoDB Positron pour un fond clair qui fait ressortir les données
     m = folium.Map(location=[center.y, center.x], zoom_start=13, tiles="cartodbpositron")
 
-    # 1. Limite Administrative
+    # 1. Limite Administrative (en premier pour être en dessous)
     folium.GeoJson(
         selected_zone,
         name="Limites Administratives",
         style_function=lambda x: {
             'fillColor': '#ff7800', 
             'color': '#ff7800', 
-            'weight': 3, 
-            'fillOpacity': 0.1
+            'weight': 2, 
+            'fillOpacity': 0.05
         }
     ).add_to(m)
 
     # 2. Réseau Routier
     if routes is not None and not routes.empty:
         folium.GeoJson(
-            routes,
+            routes.__geo_interface__,
             name="Routes & Chemins",
             style_function=lambda x: {
-                'color': '#555555', 
-                'weight': 1.5, 
-                'opacity': 0.8
+                'color': '#333333', 
+                'weight': 2, 
+                'opacity': 1.0
             }
         ).add_to(m)
 
     # 3. Bâtiments
     if buildings is not None and not buildings.empty:
-        # Création d'une colonne type simplifiée pour le style
-        # On s'assure que les colonnes existent avant de les utiliser
+        # Nettoyage des colonnes pour éviter les erreurs JSON
         buildings['display_type'] = "Bâtiment"
         if 'amenity' in buildings.columns:
             buildings['display_type'] = buildings['amenity'].fillna(buildings.get('building', 'Bâtiment'))
         elif 'building' in buildings.columns:
             buildings['display_type'] = buildings['building'].fillna('Bâtiment')
             
-        # S'assurer que 'name' existe
         if 'name' not in buildings.columns:
             buildings['name'] = "Inconnu"
         
+        # Conversion explicite en interface GeoJSON pour assurer la compatibilité Folium
         folium.GeoJson(
-            buildings,
+            buildings.__geo_interface__,
             name="Bâtiments & Infrastructures",
             style_function=lambda x: {
                 'fillColor': '#2ecc71', 
                 'color': '#27ae60', 
                 'weight': 1, 
-                'fillOpacity': 0.7
+                'fillOpacity': 0.8
             },
             tooltip=folium.GeoJsonTooltip(
                 fields=['display_type', 'name'], 
@@ -188,13 +188,13 @@ if selected_zone is not None:
     # Affichage de la carte
     st_folium(m, width="100%", height=700, key="osm_viewer_map")
     
-    # --- Table des données (optionnel) ---
+    # --- Table des données ---
     if st.checkbox("Afficher la liste des infrastructures"):
         if not buildings.empty:
             cols_to_show = [c for c in ['name', 'display_type'] if c in buildings.columns]
             st.dataframe(buildings[cols_to_show].dropna(subset=['name'] if 'name' in buildings.columns else []), use_container_width=True)
         else:
-            st.write("Aucune donnée textuelle disponible pour ces bâtiments.")
+            st.write("Aucune donnée textuelle disponible.")
 
 else:
     st.warning("Veuillez sélectionner une zone administrative dans la barre latérale.")
