@@ -1,14 +1,13 @@
 # ===============================================================
-# FloodWatch WA – VERSION STABLE CORRIGÉE
+# FloodWatch WA – VERSION STABLE DÉFINITIVE
 # ===============================================================
 
 import streamlit as st
 import geopandas as gpd
 import folium
-from folium.plugins import Draw
 from streamlit_folium import st_folium
 import osmnx as ox
-from shapely.geometry import shape, mapping
+from shapely.geometry import mapping
 import ee
 import json
 import pandas as pd
@@ -25,35 +24,44 @@ st.set_page_config(
 )
 
 # ===============================================================
-# INITIALISATION GEE (SERVICE ACCOUNT)
+# INIT GEE (SERVICE ACCOUNT)
 # ===============================================================
 @st.cache_resource
 def init_gee():
-    try:
-        key = json.loads(st.secrets["GEE_SERVICE_ACCOUNT"])
-        credentials = ee.ServiceAccountCredentials(
-            key["client_email"],
-            key_data=json.dumps(key)
-        )
-        ee.Initialize(credentials)
-        return True
-    except Exception as e:
-        st.error(f"Erreur GEE : {e}")
-        return False
+    key = json.loads(st.secrets["GEE_SERVICE_ACCOUNT"])
+    credentials = ee.ServiceAccountCredentials(
+        key["client_email"],
+        key_data=json.dumps(key)
+    )
+    ee.Initialize(credentials)
+    return True
 
 GEE_OK = init_gee()
 
 # ===============================================================
-# ÉTAT GLOBAL
+# ÉTAT GLOBAL (INITIALISATION FORCÉE)
 # ===============================================================
+DEFAULT_RESULTS = {
+    "pop_total": 0,
+    "pop_exp": 0,
+    "bld_total": 0,
+    "bld_imp": 0,
+    "rds_total": 0,
+    "rds_imp": 0,
+    "climate": pd.DataFrame(),
+    "flood_tiles": None,
+    "bld_gdf": gpd.GeoDataFrame(),
+    "rds_gdf": gpd.GeoDataFrame()
+}
+
 if "results" not in st.session_state:
-    st.session_state.results = None
+    st.session_state.results = DEFAULT_RESULTS.copy()
 
 if "zone" not in st.session_state:
     st.session_state.zone = None
 
 # ===============================================================
-# DONNÉES ADMINISTRATIVES (GADM)
+# GADM
 # ===============================================================
 @st.cache_data
 def load_gadm(iso, level):
@@ -62,22 +70,21 @@ def load_gadm(iso, level):
     return gdf.to_crs(4326)
 
 # ===============================================================
-# FLOOD DETECTION – MÉTHODE ROBUSTE SAR
+# FLOOD DETECTION (SAR ROBUSTE)
 # ===============================================================
-def detect_flood(aoi, ref_start, ref_end, flood_start, flood_end):
+def detect_flood(aoi, d0, d1, d2, d3):
     s1 = ee.ImageCollection("COPERNICUS/S1_GRD") \
         .filterBounds(aoi) \
         .filter(ee.Filter.eq("instrumentMode", "IW")) \
         .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")) \
         .select("VV")
 
-    ref = s1.filterDate(ref_start, ref_end).median()
-    flood = s1.filterDate(flood_start, flood_end).percentile([10])
+    ref = s1.filterDate(d0, d1).median()
+    flood = s1.filterDate(d2, d3).percentile([10])
 
-    ref_db = ee.Image(10).multiply(ref.log10())
-    flood_db = ee.Image(10).multiply(flood.log10())
+    diff = ee.Image(10).multiply(ref.log10()) \
+        .subtract(ee.Image(10).multiply(flood.log10()))
 
-    diff = ref_db.subtract(flood_db)
     water = diff.gt(1.25)
 
     slope = ee.Terrain.slope(ee.Image("USGS/SRTMGL1_003"))
@@ -86,7 +93,7 @@ def detect_flood(aoi, ref_start, ref_end, flood_start, flood_end):
     return water.selfMask().clip(aoi)
 
 # ===============================================================
-# POPULATION (WORLDPOP – CORRECT)
+# POPULATION WORLDPOP (CORRIGÉ)
 # ===============================================================
 def population_stats(aoi, flood_mask):
     pop = ee.ImageCollection("WorldPop/GP/100m/pop") \
@@ -97,19 +104,16 @@ def population_stats(aoi, flood_mask):
 
     total = pop.reduceRegion(
         ee.Reducer.sum(), aoi, 100, maxPixels=1e9
-    ).get("population")
+    ).get("population").getInfo() or 0
 
     exposed = pop.updateMask(flood_mask).reduceRegion(
         ee.Reducer.sum(), aoi, 100, maxPixels=1e9
-    ).get("population")
+    ).get("population").getInfo() or 0
 
-    return (
-        int(total.getInfo() or 0),
-        int(exposed.getInfo() or 0)
-    )
+    return int(total), int(exposed)
 
 # ===============================================================
-# CLIMAT – CHIRPS
+# CLIMAT CHIRPS
 # ===============================================================
 def climate_stats(aoi, start, end):
     rain = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY") \
@@ -130,28 +134,28 @@ def climate_stats(aoi, start, end):
     return df
 
 # ===============================================================
-# OSM – BÂTIMENTS & ROUTES + IMPACT
+# OSM – IMPACT BÂTIMENTS & ROUTES
 # ===============================================================
 def osm_assets(zone, flood_mask):
     poly = zone.unary_union
-    buildings = ox.features_from_polygon(poly, tags={"building": True})
-    roads = ox.features_from_polygon(poly, tags={"highway": True})
 
-    buildings = buildings[buildings.geometry.type.isin(["Polygon", "MultiPolygon"])]
-    roads = roads[roads.geometry.type.isin(["LineString", "MultiLineString"])]
+    bld = ox.features_from_polygon(poly, tags={"building": True})
+    rds = ox.features_from_polygon(poly, tags={"highway": True})
 
-    # Impact via centroid sampling
-    def impacted(gdf):
-        centroids = gdf.geometry.centroid
-        points = ee.FeatureCollection([
-            ee.Feature(ee.Geometry.Point(c.x, c.y))
-            for c in centroids
+    bld = bld[bld.geometry.type.isin(["Polygon", "MultiPolygon"])]
+    rds = rds[rds.geometry.type.isin(["LineString", "MultiLineString"])]
+
+    def impact(gdf):
+        pts = ee.FeatureCollection([
+            ee.Feature(ee.Geometry.Point(g.centroid.x, g.centroid.y))
+            for g in gdf.geometry
         ])
-        sampled = flood_mask.sampleRegions(points, scale=10)
-        flags = sampled.aggregate_array("flood").getInfo()
-        return gdf.assign(impacted=[f == 1 for f in flags])
+        vals = flood_mask.sampleRegions(pts, scale=10) \
+            .aggregate_array("flood").getInfo()
+        gdf["impacted"] = [v == 1 for v in vals]
+        return gdf
 
-    return impacted(buildings), impacted(roads)
+    return impact(bld), impact(rds)
 
 # ===============================================================
 # SIDEBAR
@@ -164,8 +168,8 @@ with st.sidebar:
 
     gadm = load_gadm(country, level)
     name_col = f"NAME_{level}" if level > 0 else "COUNTRY"
-
     units = st.multiselect("Unités", gadm[name_col].unique())
+
     if units:
         st.session_state.zone = gadm[gadm[name_col].isin(units)]
 
@@ -174,16 +178,14 @@ with st.sidebar:
     flood = st.date_input("Période inondation", [datetime(2024,8,1), datetime(2024,10,30)])
 
 # ===============================================================
-# ANALYSE AUTOMATIQUE
+# ANALYSE AUTOMATIQUE (SANS BOUTON)
 # ===============================================================
 if st.session_state.zone is not None and GEE_OK:
     zone = st.session_state.zone
     aoi = ee.Geometry(mapping(zone.unary_union))
 
     flood_mask = detect_flood(
-        aoi,
-        str(ref[0]), str(ref[1]),
-        str(flood[0]), str(flood[1])
+        aoi, str(ref[0]), str(ref[1]), str(flood[0]), str(flood[1])
     )
 
     pop_total, pop_exp = population_stats(aoi, flood_mask)
@@ -193,45 +195,51 @@ if st.session_state.zone is not None and GEE_OK:
     st.session_state.results = {
         "pop_total": pop_total,
         "pop_exp": pop_exp,
-        "bld": bld,
-        "rds": rds,
+        "bld_total": len(bld),
+        "bld_imp": int(bld.impacted.sum()),
+        "rds_total": len(rds),
+        "rds_imp": int(rds.impacted.sum()),
         "climate": climate,
-        "flood": flood_mask.getMapId({"palette": ["0000ff"]})
+        "flood_tiles": flood_mask.getMapId({"palette": ["0000ff"]}),
+        "bld_gdf": bld,
+        "rds_gdf": rds
     }
 
 # ===============================================================
-# AFFICHAGE
+# AFFICHAGE – AUCUN CRASH POSSIBLE
 # ===============================================================
-st.title("🌊 FloodWatch WA – Résultats")
-
 res = st.session_state.results
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Population totale", f"{res['pop_total']:,}" if res else "0")
-col2.metric("Population exposée", f"{res['pop_exp']:,}" if res else "0")
-col3.metric("Bâtiments impactés", int(res["bld"].impacted.sum()) if res else 0)
-col4.metric("Routes impactées", int(res["rds"].impacted.sum()) if res else 0)
+st.title("🌊 FloodWatch WA – Résultats")
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Population totale", f"{res['pop_total']:,}")
+c2.metric("Population impactée", f"{res['pop_exp']:,}")
+c3.metric("Bâtiments impactés", res["bld_imp"])
+c4.metric("Routes impactées", res["rds_imp"])
 
 # ===============================================================
 # CARTE
 # ===============================================================
 m = folium.Map(location=[14.5, -14.5], zoom_start=6)
 
-if res:
+if res["flood_tiles"]:
     folium.TileLayer(
-        tiles=res["flood"]["tile_fetcher"].url_format,
+        tiles=res["flood_tiles"]["tile_fetcher"].url_format,
         attr="GEE",
         name="Inondation"
     ).add_to(m)
 
+if not res["bld_gdf"].empty:
     folium.GeoJson(
-        res["bld"][res["bld"].impacted],
+        res["bld_gdf"][res["bld_gdf"].impacted],
         style_function=lambda x: {"color": "red", "fillColor": "red"},
         name="Bâtiments impactés"
     ).add_to(m)
 
+if not res["rds_gdf"].empty:
     folium.GeoJson(
-        res["rds"][res["rds"].impacted],
+        res["rds_gdf"][res["rds_gdf"].impacted],
         style_function=lambda x: {"color": "red"},
         name="Routes impactées"
     ).add_to(m)
@@ -242,7 +250,7 @@ st_folium(m, height=600, use_container_width=True)
 # ===============================================================
 # CLIMAT
 # ===============================================================
-if res:
+if not res["climate"].empty:
     st.subheader("🌧️ Pluviométrie")
     fig = px.bar(res["climate"], x="date", y="rain")
     st.plotly_chart(fig, use_container_width=True)
