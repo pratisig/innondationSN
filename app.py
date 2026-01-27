@@ -53,7 +53,6 @@ def get_flood_mask(aoi_ee, start_flood, end_flood, threshold=4.0):
     """Génère un masque d'inondation Sentinel-1 en excluant l'eau permanente"""
     if not gee_available: return None
     try:
-        # 1. Données Sentinel-1 (Période d'inondation)
         s1_col = (ee.ImageCollection("COPERNICUS/S1_GRD")
                   .filterBounds(aoi_ee)
                   .filter(ee.Filter.eq("instrumentMode", "IW"))
@@ -63,25 +62,18 @@ def get_flood_mask(aoi_ee, start_flood, end_flood, threshold=4.0):
         
         img_flood = s1_col.min().clip(aoi_ee).focal_median(50, 'circle', 'meters')
 
-        # 2. Référence historique (Saison sèche ou médiane annuelle)
-        # On utilise une médiane sur une période stable pour comparer
         img_ref = (ee.ImageCollection("COPERNICUS/S1_GRD")
                    .filterBounds(aoi_ee)
                    .filterDate("2023-01-01", "2023-04-30")
                    .select('VV').median().clip(aoi_ee).focal_median(50, 'circle', 'meters'))
 
-        # 3. Calcul de la différence
         diff = img_ref.subtract(img_flood)
         flood_raw = diff.gt(threshold)
 
-        # 4. Exclusion des eaux permanentes (JRC Global Surface Water)
-        # On exclut les zones où l'eau est présente plus de 80% du temps
         permanent_water = ee.Image("JRC/GSW1_4/GlobalSurfaceWater").select('occurrence')
         water_mask = permanent_water.gt(80).clip(aoi_ee)
         
-        # Le masque final : Zones inondées ET qui ne sont pas de l'eau permanente
         final_flood = flood_raw.where(water_mask, 0).selfMask()
-        
         return final_flood.rename('flood')
     except: return None
 
@@ -89,12 +81,10 @@ def get_population_stats(aoi_ee, flood_mask):
     """Calcule la population via WorldPop (Découpage strict par AOI)"""
     if not gee_available: return 0, 0
     try:
-        # Mosaïque 2020 pour la couverture. Le .clip(aoi_ee) assure le découpage spatial.
         pop_dataset = ee.ImageCollection("WorldPop/GP/100m/pop") \
                         .filterDate('2020-01-01', '2021-01-01') \
                         .mosaic().clip(aoi_ee)
         
-        # Population totale (le paramètre geometry assure que seul le polygone est compté)
         stats_total = pop_dataset.reduceRegion(
             reducer=ee.Reducer.sum(),
             geometry=aoi_ee,
@@ -105,7 +95,6 @@ def get_population_stats(aoi_ee, flood_mask):
         
         exposed_pop = 0
         if flood_mask:
-            # Population dans les zones inondées uniquement
             stats_exposed = pop_dataset.updateMask(flood_mask).reduceRegion(
                 reducer=ee.Reducer.sum(),
                 geometry=aoi_ee,
@@ -115,8 +104,7 @@ def get_population_stats(aoi_ee, flood_mask):
             exposed_pop = stats_exposed.get('population').getInfo() or 0
             
         return int(total_pop), int(exposed_pop)
-    except:
-        return 0, 0
+    except: return 0, 0
 
 def get_area_stats(aoi_ee, flood_mask):
     """Superficie inondée en hectares"""
@@ -132,14 +120,21 @@ def get_area_stats(aoi_ee, flood_mask):
     except: return 0.0
 
 def get_osm_data(_gdf_aoi):
-    """Bâtiments et routes via OSM"""
+    """Récupération ciblée des infrastructures sociales et du réseau routier"""
     if _gdf_aoi is None or _gdf_aoi.empty: return gpd.GeoDataFrame(), gpd.GeoDataFrame()
     try:
         poly = _gdf_aoi.unary_union
+        # Réseau routier
         graph = ox.graph_from_polygon(poly, network_type='all', simplify=True)
         gdf_routes = ox.graph_to_gdfs(graph, nodes=False, edges=True).reset_index().clip(_gdf_aoi)
         
-        tags = {'building': True, 'amenity': True, 'healthcare': True, 'education': True}
+        # Tags spécifiques pour Écoles et Hôpitaux
+        tags = {
+            'building': True, 
+            'amenity': ['school', 'university', 'college', 'hospital', 'clinic', 'doctors'],
+            'healthcare': True, 
+            'education': True
+        }
         try:
             gdf_buildings = ox.features_from_polygon(poly, tags=tags)
         except:
@@ -152,10 +147,10 @@ def get_osm_data(_gdf_aoi):
     except: return gpd.GeoDataFrame(), gpd.GeoDataFrame()
 
 def analyze_impacted_infra(flood_mask, buildings_gdf):
-    """Identification des bâtiments touchés"""
+    """Identification des bâtiments touchés par l'eau"""
     if flood_mask is None or buildings_gdf.empty: return gpd.GeoDataFrame()
     try:
-        infra_check = buildings_gdf.head(2000).copy()
+        infra_check = buildings_gdf.head(3000).copy()
         features = []
         for i, row in infra_check.iterrows():
             features.append(ee.Feature(ee.Geometry(mapping(row.geometry)), {'idx': i}))
@@ -165,6 +160,23 @@ def analyze_impacted_infra(flood_mask, buildings_gdf):
         impacted_indices = [f['properties']['idx'] for f in reduced.filter(ee.Filter.gt('mean', 0)).getInfo()['features']]
         
         return infra_check.loc[impacted_indices]
+    except: return gpd.GeoDataFrame()
+
+def analyze_impacted_roads(flood_mask, routes_gdf):
+    """Identification des segments routiers coupés par l'eau"""
+    if flood_mask is None or routes_gdf.empty: return gpd.GeoDataFrame()
+    try:
+        roads_check = routes_gdf.head(5000).copy()
+        features = []
+        for i, row in roads_check.iterrows():
+            features.append(ee.Feature(ee.Geometry(mapping(row.geometry)), {'idx': i}))
+            
+        fc = ee.FeatureCollection(features)
+        # On utilise mean > 0 pour détecter une intersection avec le masque
+        reduced = flood_mask.reduceRegions(collection=fc, reducer=ee.Reducer.mean(), scale=10)
+        impacted_indices = [f['properties']['idx'] for f in reduced.filter(ee.Filter.gt('mean', 0)).getInfo()['features']]
+        
+        return roads_check.loc[impacted_indices]
     except: return gpd.GeoDataFrame()
 
 # ═════════════════════════════════════════════════════════════════
@@ -221,7 +233,7 @@ if st.session_state.selected_zone is not None:
         st.session_state.analysis_triggered = True
 
     if st.session_state.analysis_triggered:
-        with st.spinner("Calculs en cours... (Exclusion eaux permanentes activée)"):
+        with st.spinner("Analyse en cours (Pop, Masque, Écoles, Hôpitaux, Routes)..."):
             # A. GEE
             aoi_ee_global = ee.Geometry(mapping(st.session_state.selected_zone.unary_union))
             flood_mask = get_flood_mask(aoi_ee_global, str(start_f), str(end_f), threshold_val)
@@ -229,6 +241,7 @@ if st.session_state.selected_zone is not None:
             # B. OSM & Impacts
             buildings, routes = get_osm_data(st.session_state.selected_zone)
             impacted_infra = analyze_impacted_infra(flood_mask, buildings)
+            impacted_roads = analyze_impacted_roads(flood_mask, routes)
             
             # C. Stats par subdivision
             temp_list = []
@@ -246,7 +259,7 @@ if st.session_state.selected_zone is not None:
                     'Pop. Totale': t_pop,
                     'Pop. Exposée': e_pop,
                     'Inondation (ha)': round(f_area, 2),
-                    'Bâtiments Touchés': n_infra
+                    'Impacts (Bât)': n_infra
                 })
             
             # KPIs Globaux
@@ -258,47 +271,60 @@ if st.session_state.selected_zone is not None:
             st.subheader("📊 Bilan Global de l'Évènement")
             k1, k2, k3, k4 = st.columns(4)
             with k1: st.metric("Population Totale", f"{total_pop_all:,}")
-            with k2: 
-                perc_pop = (total_pop_exposed / total_pop_all * 100) if total_pop_all > 0 else 0
-                st.metric("Population Exposée", f"{total_pop_exposed:,}")
+            with k2: st.metric("Population Exposée", f"{total_pop_exposed:,}")
             with k3: st.metric("Surface Inondée", f"{total_flood_ha:,.1f} ha")
-            with k4: st.metric("Bâtiments Impactés", len(impacted_infra))
+            with k4: st.metric("Routes Touchées", f"{len(impacted_roads)} segments")
 
             # --- SECTION 2: GRAPHIQUES ---
             c1, c2 = st.columns([1, 1])
             with c1:
                 if not impacted_infra.empty:
-                    impacted_infra['Type'] = impacted_infra.get('amenity', impacted_infra.get('building', 'Autre')).fillna('Résidentiel')
-                    fig = px.pie(impacted_infra, names='Type', hole=0.5, title="Typologie des Infrastructures Touchées")
+                    # Traduction des types pour le graphique
+                    def translate_type(row):
+                        t = str(row.get('amenity', row.get('building', 'Autre'))).lower()
+                        if any(x in t for x in ['school', 'university', 'college', 'education']): return "Éducation"
+                        if any(x in t for x in ['hospital', 'clinic', 'doctors', 'health']): return "Santé"
+                        return "Autre Bâtiment"
+                    
+                    impacted_infra['Type_Fr'] = impacted_infra.apply(translate_type, axis=1)
+                    fig = px.pie(impacted_infra, names='Type_Fr', hole=0.5, title="Typologie des Infrastructures Impactées")
                     st.plotly_chart(fig, use_container_width=True)
 
             with c2:
-                # Barre de proportion sans flèches delta
-                df_gauge = pd.DataFrame({"État": ["Exposé", "Sain"], 
-                                         "Valeur": [perc_pop, 100-perc_pop]})
+                perc_pop = (total_pop_exposed / total_pop_all * 100) if total_pop_all > 0 else 0
+                df_gauge = pd.DataFrame({"État": ["Exposé", "Sain"], "Valeur": [perc_pop, 100-perc_pop]})
                 fig_bar = px.bar(df_gauge, x="Valeur", y="État", orientation='h', 
                                  color="État", color_discrete_map={"Exposé": "#d62728", "Sain": "#2ca02c"},
-                                 title="Proportion de la Population en Zone Inondable (%)")
+                                 title="Proportion de la Population Affectée (%)")
                 st.plotly_chart(fig_bar, use_container_width=True)
 
             # --- SECTION 3: CARTE ---
-            st.subheader("🗺️ Carte des Risques (Bleu = Eau Temporaire)")
+            st.subheader("🗺️ Carte des Impacts (Rouge = Infrastructures & Routes touchées)")
             center = st.session_state.selected_zone.centroid.iloc[0]
             m = folium.Map(location=[center.y, center.x], zoom_start=12, tiles="cartodbpositron")
             
             if flood_mask:
                 map_id = flood_mask.getMapId({'palette': ['#00bfff']})
-                folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name='Inondations').add_to(m)
+                folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name='Masque Eau').add_to(m)
 
-            folium.GeoJson(st.session_state.selected_zone, name="Zone", 
-                           style_function=lambda x: {'fillColor': 'none', 'color': 'orange'}).add_to(m)
+            folium.GeoJson(st.session_state.selected_zone, name="Emprise", 
+                           style_function=lambda x: {'fillColor': 'none', 'color': 'gray', 'weight': 1}).add_to(m)
+
+            if not routes.empty:
+                folium.GeoJson(routes, name="Réseau routier complet", 
+                               style_function=lambda x: {'color': '#bbb', 'weight': 1, 'opacity': 0.5}).add_to(m)
+
+            if not impacted_roads.empty:
+                folium.GeoJson(impacted_roads, name="Routes Impactées",
+                               style_function=lambda x: {'color': 'red', 'weight': 4, 'opacity': 0.9}).add_to(m)
 
             if not impacted_infra.empty:
-                folium.GeoJson(impacted_infra, name="Impacts",
-                               style_function=lambda x: {'fillColor': 'red', 'color': 'red'}).add_to(m)
+                folium.GeoJson(impacted_infra, name="Bâtiments Impactés",
+                               style_function=lambda x: {'fillColor': '#e60000', 'color': '#800000', 'weight': 2, 'fillOpacity': 0.8},
+                               tooltip=folium.GeoJsonTooltip(fields=['Type_Fr'], aliases=['Type:'])).add_to(m)
 
             folium.LayerControl().add_to(m)
             st_folium(m, width="100%", height=600, key="map_res")
             
-            st.subheader("📋 Détails par Subdivision")
+            st.subheader("📋 Synthèse par Secteur")
             st.table(pd.DataFrame(temp_list))
