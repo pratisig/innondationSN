@@ -19,4 +19,5 @@ matplotlib
 reportlab 
 pandas 
 numpy
-pyogrio  
+pyogrio 
+altair
