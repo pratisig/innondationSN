@@ -10,3 +10,12 @@ plotly
 osmnx 
 reportlab
 fpdf
+shapely
+fiona 
+pyproj 
+rasterio
+requests
+matplotlib
+reportlab 
+pandas 
+numpy
