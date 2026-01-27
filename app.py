@@ -162,7 +162,8 @@ elif mode == "Importer Fichier":
     up = st.sidebar.file_uploader("Fichier Géo (GeoJSON, KML)", type=['geojson', 'kml'])
     if up: 
         try:
-            st.session_state.selected_zone = gpd.read_file(up).to_crs(epsg:4326)
+            # Correction de la syntaxe : ajout des guillemets pour 'epsg:4326'
+            st.session_state.selected_zone = gpd.read_file(up).to_crs("epsg:4326")
             st.session_state.zone_name = "Zone Importée"
         except:
             st.sidebar.error("Erreur lors de la lecture du fichier.")
