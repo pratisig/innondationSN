@@ -35,28 +35,24 @@ st.set_page_config(
 
 st.title("Plateforme d’analyse des inondations – Afrique de l’Ouest")
 
-# =========================
-# 2. AUTHENTIFICATION GEE
-# =========================
-
-# Le secret doit contenir la clé de service GEE au format JSON
-GEE_SERVICE_ACCOUNT_JSON = st.secrets.get("GEE_SERVICE_ACCOUNT_JSON", None)
-
-gee_available = False
-try:
-    import ee
-    if GEE_SERVICE_ACCOUNT_JSON:
-        credentials = ee.ServiceAccountCredentials(
-            json.load(io.StringIO(GEE_SERVICE_ACCOUNT_JSON))["client_email"],
-            key_data=GEE_SERVICE_ACCOUNT_JSON
-        )
+# ------------------------------------------------------------
+# INIT GEE
+# ------------------------------------------------------------
+@st.cache_resource
+def init_gee():
+    if "GEE_SERVICE_ACCOUNT" not in st.secrets:
+        st.error("Secret 'GEE_SERVICE_ACCOUNT' manquant dans Streamlit.")
+        st.stop()
+    try:
+        key = json.loads(st.secrets["GEE_SERVICE_ACCOUNT"])
+        credentials = ee.ServiceAccountCredentials(key["client_email"], key_data=json.dumps(key))
         ee.Initialize(credentials)
-    else:
-        ee.Initialize()
-    gee_available = True
-except Exception as e:
-    st.error("Erreur d'initialisation de Google Earth Engine. Vérifiez les secrets.")
-    st.exception(e)
+        return True
+    except Exception as e:
+        st.error(f"Erreur d'initialisation GEE : {e}")
+        return False
+
+init_gee()
 
 # =========================
 # 3. FONCTIONS UTILITAIRES
