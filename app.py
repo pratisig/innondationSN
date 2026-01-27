@@ -88,12 +88,10 @@ def get_flood_mask(aoi_ee, start_ref, end_ref, start_flood, end_flood, threshold
         img_ref = s1.filterDate(start_ref, end_ref).median().clip(aoi_ee)
         img_flood = s1.filterDate(start_flood, end_flood).min().clip(aoi_ee)
         
-        # Filtre de réduction du bruit
         img_ref = img_ref.focal_median(50, 'circle', 'meters')
         img_flood = img_flood.focal_median(50, 'circle', 'meters')
 
         diff = img_ref.subtract(img_flood)
-        # Renvoie 1 pour l'eau, masqué ailleurs
         return diff.gt(threshold).rename('flood').selfMask()
     except Exception: return None
 
@@ -144,14 +142,15 @@ def get_osm_buildings(_gdf_aoi):
         poly = _gdf_aoi.unary_union.convex_hull
         tags = {
             'building': True, 
-            'amenity': ['hospital', 'school', 'clinic', 'pharmacy', 'marketplace', 'place_of_worship']
+            'amenity': ['hospital', 'school', 'clinic', 'pharmacy', 'marketplace', 'place_of_worship'],
+            'healthcare': True,
+            'office': 'government'
         }
         data = ox.geometries_from_polygon(poly, tags=tags)
         if data.empty: return gpd.GeoDataFrame()
         
-        # Nettoyage : conversion en polygones et suppression du bruit
         data = data[data.geometry.type.isin(['Polygon', 'MultiPolygon'])]
-        return data.clip(_gdf_aoi)
+        return data.clip(_gdf_aoi).reset_index(drop=True)
     except Exception: return gpd.GeoDataFrame()
 
 # ═════════════════════════════════════════════════════════════════
@@ -186,7 +185,7 @@ st.sidebar.markdown("---")
 d1, d2 = st.sidebar.columns(2)
 start_f = d1.date_input("Début Inondation", datetime(2024, 8, 1))
 end_f = d2.date_input("Fin Inondation", datetime(2024, 9, 30))
-flood_threshold = st.sidebar.slider("Seuil Détection (dB)", 3.0, 10.0, 5.0, 0.5)
+flood_threshold = st.sidebar.slider("Seuil Détection (dB)", 2.0, 10.0, 4.0, 0.5)
 
 # ═════════════════════════════════════════════════════════════════
 # 4. LOGIQUE D'ANALYSE
@@ -197,58 +196,61 @@ st.title("🌊 Analyse des Infrastructures Impactées")
 if st.button("🚀 LANCER L'ANALYSE", type="primary"):
     st.session_state.analysis_done = True
     
-    with st.spinner("Analyse spatiale et croisement des données..."):
-        # 1. Masque Inondation GEE
+    with st.spinner("Récupération des données et analyse GEE..."):
+        # 1. Préparation AOI GEE
         full_aoi_ee = ee.Geometry(mapping(selected_zone.unary_union))
+        
+        # 2. Masque Inondation
         st.session_state.flood_mask = get_flood_mask(full_aoi_ee, "2023-01-01", "2023-05-01", str(start_f), str(end_f), flood_threshold)
         
-        # 2. Précipitations
+        # 3. Précipitations
         st.session_state.precip = get_precip_cumul(full_aoi_ee, str(start_f), str(end_f))
         
-        # 3. Récupération OSM
+        # 4. Récupération OSM
         buildings_gdf = get_osm_buildings(selected_zone)
         
-        # 4. Identification des infrastructures impactées via échantillonnage GEE
-        # Cette méthode est beaucoup plus fiable que reduceToVectors
+        # 5. Croisement spatial natif dans GEE (OSM -> GEE)
         if st.session_state.flood_mask and not buildings_gdf.empty:
-            # Création de points à partir des centroïdes des bâtiments pour l'échantillonnage
-            centroids = buildings_gdf.copy()
-            centroids['geometry'] = centroids.geometry.centroid
+            # Conversion du GeoDataFrame en liste de Features pour GEE
+            # On limite à 1000 bâtiments pour éviter les timeouts API (gestion par batch possible)
+            infra_to_check = buildings_gdf.head(2000).copy()
             
-            # Conversion en FeatureCollection GEE
             features = []
-            for i, row in centroids.iterrows():
+            for i, row in infra_to_check.iterrows():
+                # On simplifie légèrement la géométrie pour GEE
                 geom = mapping(row.geometry)
-                features.append(ee.Feature(ee.Geometry.Point(geom['coordinates']), {'osm_id': str(i)}))
+                props = {
+                    'osm_index': i,
+                    'type': str(row.get('amenity', row.get('building', 'Inconnu'))),
+                    'name': str(row.get('name', 'Sans nom'))
+                }
+                features.append(ee.Feature(ee.Geometry(geom), props))
             
-            fc_centroids = ee.FeatureCollection(features)
+            fc_infra = ee.FeatureCollection(features)
             
-            # Échantillonnage : on regarde si le pixel 'flood' est présent sous le bâtiment
-            sampled = st.session_state.flood_mask.sampleRegions(
-                collection=fc_centroids,
-                scale=10, # Plus précis pour les bâtiments
-                geometries=False
-            ).getInfo()
+            # Intersection spatiale robuste : on calcule la moyenne des pixels d'inondation par bâtiment
+            # Si mean > 0, le bâtiment touche au moins un pixel bleu
+            impact_results = st.session_state.flood_mask.reduceRegions(
+                collection=fc_infra,
+                reducer=ee.Reducer.mean(),
+                scale=10
+            ).filter(ee.Filter.gt('mean', 0)).getInfo()
             
-            # Récupération des IDs impactés
-            impacted_ids = [f['properties']['osm_id'] for f in sampled['features'] if f['properties'].get('flood') == 1]
-            st.session_state.impacted_infra = buildings_gdf.loc[impacted_ids].copy()
+            impacted_indices = [f['properties']['osm_index'] for f in impact_results['features']]
+            st.session_state.impacted_infra = infra_to_check.loc[impacted_indices].copy()
         else:
             st.session_state.impacted_infra = gpd.GeoDataFrame()
         
-        # 5. Analyse par polygone administratif
+        # 6. Analyse par polygone administratif
         temp_list = []
         for idx, row in selected_zone.iterrows():
             geom_ee = ee.Geometry(mapping(row.geometry))
             t_pop, e_pop = get_population_stats(geom_ee, st.session_state.flood_mask)
             f_area = get_area_stats(geom_ee, st.session_state.flood_mask)
             
-            # Filtrer les infrastructures impactées dans ce polygone spécifique
             if not st.session_state.impacted_infra.empty:
-                # On utilise sjoin pour être sûr de l'appartenance au polygone
-                poly_gdf = gpd.GeoDataFrame(geometry=[row.geometry], crs="EPSG:4326")
-                infra_in_poly = gpd.sjoin(st.session_state.impacted_infra, poly_gdf, how="inner", predicate="intersects")
-                
+                # Intersection locale pour les statistiques par zone
+                infra_in_poly = st.session_state.impacted_infra[st.session_state.impacted_infra.intersects(row.geometry)]
                 counts = infra_in_poly['amenity'].fillna('Bâtiment/Résidentiel').value_counts().to_dict()
                 n_total_infra = len(infra_in_poly)
             else:
@@ -267,12 +269,12 @@ if st.button("🚀 LANCER L'ANALYSE", type="primary"):
         
         st.session_state.results_gdf = gpd.GeoDataFrame(temp_list, crs="EPSG:4326")
         
-        # Statistiques Globales
+        # Stats globales
         st.session_state.stats = {
             "pop_exposed": sum(d['pop_exposed'] for d in temp_list),
             "total_pop": sum(d['pop_total'] for d in temp_list),
             "total_flood_ha": sum(d['flood_ha'] for d in temp_list),
-            "total_infra": sum(d['n_infra'] for d in temp_list)
+            "total_infra": len(st.session_state.impacted_infra)
         }
 
 # ═════════════════════════════════════════════════════════════════
@@ -289,20 +291,19 @@ if st.session_state.analysis_done:
     col_map, col_list = st.columns([3, 1])
     
     with col_list:
-        st.markdown("### 🏘️ Impact par type")
+        st.markdown("### 🏘️ Typologie des Impacts")
         if not st.session_state.impacted_infra.empty:
-            summary = st.session_state.impacted_infra['amenity'].fillna('Résidentiel').value_counts()
+            summary = st.session_state.impacted_infra['amenity'].fillna('Bâtiment/Logement').value_counts()
             st.dataframe(summary, use_container_width=True)
         else:
-            st.warning("Aucun bâtiment détecté dans les zones inondées.")
+            st.warning("Aucune infrastructure touchée détectée.")
         
         st.markdown("---")
-        st.markdown("### 📍 Détails par zone")
+        st.markdown("### 📍 Bilan par Secteur")
         for _, r in st.session_state.results_gdf.iterrows():
             with st.expander(f"**{r['name']}**"):
                 st.write(f"🌊 Inondé : {r['flood_ha']:,} ha")
-                st.write(f"👥 Pop. Exposée : {r['pop_exposed']:,}")
-                st.write(f"🏠 Infras : {r['n_infra']}")
+                st.write(f"🏠 Infras touchées : {r['n_infra']}")
                 if r['infra_details']:
                     for k, v in r['infra_details'].items():
                         st.caption(f"- {k}: {v}")
@@ -311,58 +312,41 @@ if st.session_state.analysis_done:
         center = selected_zone.centroid.iloc[0]
         m = folium.Map(location=[center.y, center.x], zoom_start=11, tiles="cartodbpositron")
         
-        # 1. Limites administratives (Orange)
+        # 1. Limite Administrative (Contour Orange épais)
         folium.GeoJson(
             selected_zone,
-            name="Limites Administratives",
-            style_function=lambda x: {'fillColor': 'none', 'color': 'orange', 'weight': 3}
+            name="Limite administrative",
+            style_function=lambda x: {'fillColor': 'none', 'color': '#ff7800', 'weight': 4, 'opacity': 0.7}
         ).add_to(m)
 
-        # 2. Masque Inondation GEE (Bleu)
+        # 2. Zones inondées (Bleu)
         if st.session_state.flood_mask:
             try:
-                map_id = st.session_state.flood_mask.getMapId({'palette': ['#00d4ff']})
+                map_id = st.session_state.flood_mask.getMapId({'palette': ['#0077be']})
                 folium.TileLayer(
                     tiles=map_id['tile_fetcher'].url_format,
                     attr='Google Earth Engine',
-                    name='Zones Inondées',
+                    name='Masque Inondation',
                     overlay=True,
                     opacity=0.6
                 ).add_to(m)
             except: pass
 
-        # 3. Polygones pour Popups de zone
-        for _, row in st.session_state.results_gdf.iterrows():
-            infra_str = "<br>".join([f"- {k}: {v}" for k, v in row['infra_details'].items()])
-            popup_content = f"""
-            <div style='width:200px'>
-                <b>{row['name']}</b><br>
-                Pop. Exposée: <b style='color:red'>{row['pop_exposed']:,}</b><br>
-                Surface: {row['flood_ha']} ha<br>
-                <b>Infras Impactées:</b><br>{infra_str if infra_str else 'Aucune'}
-            </div>
-            """
-            folium.GeoJson(
-                row.geometry,
-                style_function=lambda x: {'fillColor': 'none', 'color': 'none'},
-                tooltip=row['name']
-            ).add_child(folium.Popup(popup_content)).add_to(m)
-
-        # 4. Bâtiments Impactés (Rouge)
+        # 3. Bâtiments impactés (Rouge vif)
         if not st.session_state.impacted_infra.empty:
             folium.GeoJson(
                 st.session_state.impacted_infra,
-                name="Bâtiments Touchés",
+                name="Infrastructures Impactées",
                 style_function=lambda x: {
-                    'fillColor': 'red', 
-                    'color': 'darkred', 
-                    'weight': 1, 
-                    'fillOpacity': 0.8
+                    'fillColor': '#e31a1c', 
+                    'color': '#800026', 
+                    'weight': 1.5, 
+                    'fillOpacity': 0.9
                 },
                 tooltip=folium.GeoJsonTooltip(fields=['amenity', 'name'], aliases=['Type:', 'Nom:'])
             ).add_to(m)
 
         folium.LayerControl().add_to(m)
-        st_folium(m, width="100%", height=650, key="flood_map")
+        st_folium(m, width="100%", height=700, key="map_final")
 else:
-    st.info("Sélectionnez vos zones à gauche puis cliquez sur 'Lancer l'Analyse'.")
+    st.info("Sélectionnez une zone et lancez l'analyse pour visualiser les dégâts.")
