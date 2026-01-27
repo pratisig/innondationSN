@@ -84,13 +84,11 @@ def get_climate_data(aoi_ee, start_date, end_date):
     """Récupère le cumul de pluie (CHIRPS) et la température (ERA5)"""
     if not gee_available: return None
     try:
-        # Pluie
         precip = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY") \
             .filterBounds(aoi_ee) \
             .filterDate(start_date, end_date) \
             .select('precipitation')
         
-        # Température (K to C)
         temp = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR") \
             .filterBounds(aoi_ee) \
             .filterDate(start_date, end_date) \
@@ -107,7 +105,7 @@ def get_climate_data(aoi_ee, start_date, end_date):
 
         df_p = pd.DataFrame([f['properties'] for f in p_data])
         df_t = pd.DataFrame([f['properties'] for f in t_data])
-        df_t['value'] = df_t['value'] - 273.15 # Kelvin to Celsius
+        df_t['value'] = df_t['value'] - 273.15 
         
         df_clim = df_p.merge(df_t, on='date', suffixes=('_precip', '_temp'))
         return df_clim
@@ -167,10 +165,10 @@ def analyze_impacted_infra(flood_mask, buildings_gdf):
         return infra_check.loc[impacted_indices]
     except: return gpd.GeoDataFrame()
 
-def analyze_impacted_roads(flood_mask, routes_gdf):
-    if flood_mask is None or routes_gdf.empty: return gpd.GeoDataFrame()
+def analyze_impacted_roads(flood_mask, roads_gdf):
+    if flood_mask is None or roads_gdf.empty: return gpd.GeoDataFrame()
     try:
-        roads_check = routes_gdf.head(5000).copy()
+        roads_check = roads_gdf.head(5000).copy()
         features = [ee.Feature(ee.Geometry(mapping(row.geometry)), {'idx': i}) for i, row in roads_check.iterrows()]
         fc = ee.FeatureCollection(features)
         reduced = flood_mask.reduceRegions(collection=fc, reducer=ee.Reducer.mean(), scale=10)
@@ -241,9 +239,28 @@ if st.session_state.selected_zone is not None:
             impacted_infra = analyze_impacted_infra(flood_mask, buildings)
             impacted_roads = analyze_impacted_roads(flood_mask, routes)
             
-            # C. Population
-            total_pop_all, total_pop_exposed = get_population_stats(aoi_ee_global, flood_mask)
-            total_flood_ha = get_area_stats(aoi_ee_global, flood_mask)
+            # C. Population et Superficie par subdivision
+            sector_data = []
+            total_pop_all = 0
+            total_pop_exposed = 0
+            total_flood_ha = 0
+            
+            for idx, row in st.session_state.selected_zone.iterrows():
+                geom_ee = ee.Geometry(mapping(row.geometry))
+                t_pop, e_pop = get_population_stats(geom_ee, flood_mask)
+                f_area = get_area_stats(geom_ee, flood_mask)
+                
+                total_pop_all += t_pop
+                total_pop_exposed += e_pop
+                total_flood_ha += f_area
+                
+                sector_data.append({
+                    'Secteur': row.get('NAME_2', row.get('NAME_1', st.session_state.zone_name)),
+                    'Pop. Totale': t_pop,
+                    'Pop. Exposée': e_pop,
+                    '% Impacté': f"{(e_pop/t_pop*100):.1f}%" if t_pop > 0 else "0%",
+                    'Inondation (ha)': round(f_area, 2)
+                })
             
             # --- SECTION 1: BILAN IMPACT POPULATION ---
             st.markdown("### 👥 Impact sur la Population")
@@ -255,27 +272,9 @@ if st.session_state.selected_zone is not None:
                 st.markdown(f"**⚠️ Population Sinistrée**\n<h2 style='color:{color}'>{total_pop_exposed:,}</h2>", unsafe_allow_html=True)
             with p3:
                 perc = (total_pop_exposed / total_pop_all * 100) if total_pop_all > 0 else 0
-                st.markdown(f"**📊 Taux d'Exposition**\n## {perc:.1f}%")
+                st.markdown(f"**📊 Taux d'Exposition Global**\n## {perc:.1f}%")
 
-            # --- SECTION 2: CLIMAT ET EVOLUTION ---
-            st.markdown("### ☁️ Suivi Climatique")
-            if df_climat is not None:
-                total_rain = df_climat['value_precip'].sum()
-                st.info(f"🌧️ **Cumul de pluie sur la période :** {total_rain:.1f} mm")
-                
-                fig_clim = go.Figure()
-                fig_clim.add_trace(go.Bar(x=df_climat['date'], y=df_climat['value_precip'], name="Pluie (mm)", marker_color='royalblue'))
-                fig_clim.add_trace(go.Scatter(x=df_climat['date'], y=df_climat['value_temp'], name="Température (°C)", yaxis='y2', line=dict(color='orange', width=3)))
-                
-                fig_clim.update_layout(
-                    title="Évolution Précipitations et Température",
-                    yaxis=dict(title="Précipitations (mm)"),
-                    yaxis2=dict(title="Température (°C)", overlaying='y', side='right'),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                )
-                st.plotly_chart(fig_clim, use_container_width=True)
-
-            # --- SECTION 3: CARTE & INFRA ---
+            # --- SECTION 2: CARTE & INFRA ---
             col_map, col_stats = st.columns([2, 1])
             with col_map:
                 st.markdown("#### 🗺️ Cartographie des Dégâts")
@@ -306,27 +305,43 @@ if st.session_state.selected_zone is not None:
                         if any(x in t for x in ['hospital', 'clinic', 'health']): return "🏥 Santé"
                         return "🏠 Habitat"
                     impacted_infra['Cat'] = impacted_infra.apply(translate_type, axis=1)
-                    st.plotly_chart(px.pie(impacted_infra, names='Cat', hole=0.4, title="Répartition par type"), use_container_width=True)
+                    st.plotly_chart(px.pie(impacted_infra, names='Cat', hole=0.4, title="Répartition des bât. impactés"), use_container_width=True)
 
-            # --- SECTION 4: EXPORTATION ---
+            # --- SECTION 3: CLIMAT (DÉPLACÉ SOUS LA CARTE) ---
+            st.markdown("### ☁️ Suivi Climatique & Précipitations")
+            if df_climat is not None:
+                total_rain = df_climat['value_precip'].sum()
+                st.info(f"🌧️ **Cumul de pluie sur la période :** {total_rain:.1f} mm")
+                
+                fig_clim = go.Figure()
+                fig_clim.add_trace(go.Bar(x=df_climat['date'], y=df_climat['value_precip'], name="Pluie (mm)", marker_color='royalblue'))
+                fig_clim.add_trace(go.Scatter(x=df_climat['date'], y=df_climat['value_temp'], name="Température (°C)", yaxis='y2', line=dict(color='orange', width=3)))
+                
+                fig_clim.update_layout(
+                    title="Diagramme Ombrothermique (Précipitations et Température)",
+                    yaxis=dict(title="Précipitations (mm)"),
+                    yaxis2=dict(title="Température (°C)", overlaying='y', side='right'),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                )
+                st.plotly_chart(fig_clim, use_container_width=True)
+            
+            # --- SECTION 4: TABLEAU DE SYNTHÈSE ---
+            st.markdown("### 📋 Synthèse détaillée par Secteur")
+            st.table(pd.DataFrame(sector_data))
+
+            # --- SECTION 5: EXPORTATION ---
             st.divider()
             st.markdown("### 📥 Exportation des Données")
             ex1, ex2, ex3 = st.columns(3)
             
-            # Export CSV des impacts
-            df_impact = pd.DataFrame([{
-                "Zone": st.session_state.zone_name,
-                "Pop_Totale": total_pop_all,
-                "Pop_Exposee": total_pop_exposed,
-                "Pluie_Cumul_mm": total_rain if df_climat is not None else 0,
-                "Surface_Inondee_ha": total_flood_ha
-            }])
+            # Export CSV des impacts consolidés
+            df_impact = pd.DataFrame(sector_data)
             
             with ex1:
-                st.download_button("📊 Export Rapport (CSV)", df_impact.to_csv(index=False), "rapport_impact.csv", "text/csv")
+                st.download_button("📊 Export Rapport (CSV)", df_impact.to_csv(index=False), "rapport_impact_secteurs.csv", "text/csv")
             with ex2:
                 if not impacted_infra.empty:
                     st.download_button("🏘️ Bâtiments Impactés (GeoJSON)", impacted_infra.to_json(), "batiments_impact.geojson", "application/json")
             with ex3:
                 if df_climat is not None:
-                    st.download_button("🌡️ Données Climatiques (CSV)", df_climat.to_csv(index=False), "climat.csv", "text/csv")
+                    st.download_button("🌡️ Données Climatiques (CSV)", df_climat.to_csv(index=False), "donnees_climat.csv", "text/csv")
