@@ -103,18 +103,20 @@ def get_pop_data(aoi_ee, flood_mask):
         # WorldPop 100m
         pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").filterDate('2020-01-01', '2021-01-01').mosaic().clip(aoi_ee)
         
-        total_pop = pop_img.reduceRegion(
+        total_pop_val = pop_img.reduceRegion(
             reducer=ee.Reducer.sum(), geometry=aoi_ee, scale=100, maxPixels=1e9
-        ).get('population').getInfo() or 0
+        ).get('population').getInfo()
+        total_pop = int(total_pop_val) if total_pop_val is not None else 0
         
         exposed_pop = 0
         if flood_mask:
-            exposed_pop = pop_img.updateMask(flood_mask).reduceRegion(
+            exposed_pop_val = pop_img.updateMask(flood_mask).reduceRegion(
                 reducer=ee.Reducer.sum(), geometry=aoi_ee, scale=100, maxPixels=1e9
-            ).get('population').getInfo() or 0
+            ).get('population').getInfo()
+            exposed_pop = int(exposed_pop_val) if exposed_pop_val is not None else 0
             
         perc = (exposed_pop / total_pop * 100) if total_pop > 0 else 0
-        return int(total_pop), int(exposed_pop), perc
+        return total_pop, exposed_pop, perc
     except: return 0, 0, 0
 
 def get_climate_data(aoi_ee, start, end):
@@ -217,15 +219,19 @@ if st.session_state.selected_zone is not None:
             area_ha = 0
             mask_id = None
             if flood_mask:
-                area_ha = flood_mask.multiply(ee.Image.pixelArea()).reduceRegion(
+                area_val = flood_mask.multiply(ee.Image.pixelArea()).reduceRegion(
                     reducer=ee.Reducer.sum(), geometry=aoi_ee, scale=20, maxPixels=1e9
-                ).get('flood').getInfo() or 0
+                ).get('flood').getInfo()
+                area_ha = (float(area_val) / 10000) if area_val is not None else 0
                 mask_id = flood_mask.getMapId({'palette': ['#00BFFF']})
 
             st.session_state.results = {
-                't_pop': t_pop, 'e_pop': e_pop, 'p_pop': p_pop,
-                'area': area_ha / 10000,
-                'b_count': len(bld), 'r_count': len(rts),
+                't_pop': int(t_pop), 
+                'e_pop': int(e_pop), 
+                'p_pop': float(p_pop),
+                'area': float(area_ha),
+                'b_count': len(bld), 
+                'r_count': len(rts),
                 'mask_id': mask_id,
                 'df_rain': df_rain,
                 'b_geo': bld.to_json() if not bld.empty else None,
