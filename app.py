@@ -262,17 +262,21 @@ if st.session_state.selected_zone is not None:
                     'Inondation (ha)': round(f_area, 2)
                 })
             
-            # --- SECTION 1: BILAN IMPACT POPULATION ---
-            st.markdown("### 👥 Impact sur la Population")
-            p1, p2, p3 = st.columns(3)
+            # --- SECTION 1: BILAN IMPACT POPULATION & INDICATEURS ---
+            st.markdown("### 📊 Indicateurs de Risque et d'Impact")
+            p1, p2, p3, p4 = st.columns(4)
             with p1:
                 st.markdown(f"**🏠 Population Totale**\n## {total_pop_all:,}")
             with p2:
                 color = "red" if total_pop_exposed > 0 else "gray"
-                st.markdown(f"**⚠️ Population Sinistrée**\n<h2 style='color:{color}'>{total_pop_exposed:,}</h2>", unsafe_allow_html=True)
-            with p3:
                 perc = (total_pop_exposed / total_pop_all * 100) if total_pop_all > 0 else 0
-                st.markdown(f"**📊 Taux d'Exposition Global**\n## {perc:.1f}%")
+                st.markdown(f"**⚠️ Population Sinistrée**\n<h2 style='color:{color}'>{total_pop_exposed:,} <span style='font-size: 16px; font-weight: normal; color: #555;'>( {perc:.1f}% )</span></h2>", unsafe_allow_html=True)
+            with p3:
+                st.markdown(f"**🌊 Zone Inondée**\n## {total_flood_ha:.2f} ha")
+            with p4:
+                # Calcul rapide du cumul de pluie si disponible
+                rain_sum = df_climat['value_precip'].sum() if df_climat is not None else 0
+                st.markdown(f"**🌧️ Cumul Pluie**\n## {rain_sum:.1f} mm")
 
             # --- SECTION 2: CARTE & INFRA ---
             col_map, col_stats = st.columns([2, 1])
@@ -280,6 +284,19 @@ if st.session_state.selected_zone is not None:
                 st.markdown("#### 🗺️ Cartographie des Dégâts")
                 center = st.session_state.selected_zone.centroid.iloc[0]
                 m = folium.Map(location=[center.y, center.x], zoom_start=12, tiles="cartodbpositron")
+                
+                # Ajout des polygones de la zone sélectionnée
+                folium.GeoJson(
+                    st.session_state.selected_zone,
+                    name="Zone d'Étude",
+                    style_function=lambda x: {
+                        'fillColor': '#f0f0f0',
+                        'color': 'black',
+                        'weight': 2,
+                        'fillOpacity': 0.1
+                    }
+                ).add_to(m)
+
                 if flood_mask:
                     map_id = flood_mask.getMapId({'palette': ['#00bfff']})
                     folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name='Inondations').add_to(m)
@@ -310,9 +327,6 @@ if st.session_state.selected_zone is not None:
             # --- SECTION 3: CLIMAT (DÉPLACÉ SOUS LA CARTE) ---
             st.markdown("### ☁️ Suivi Climatique & Précipitations")
             if df_climat is not None:
-                total_rain = df_climat['value_precip'].sum()
-                st.info(f"🌧️ **Cumul de pluie sur la période :** {total_rain:.1f} mm")
-                
                 fig_clim = go.Figure()
                 fig_clim.add_trace(go.Bar(x=df_climat['date'], y=df_climat['value_precip'], name="Pluie (mm)", marker_color='royalblue'))
                 fig_clim.add_trace(go.Scatter(x=df_climat['date'], y=df_climat['value_temp'], name="Température (°C)", yaxis='y2', line=dict(color='orange', width=3)))
