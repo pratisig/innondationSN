@@ -1,5 +1,5 @@
 # ============================================================
-# FLOOD ANALYSIS & EMERGENCY PLANNING APP - FIXED HASDATA
+# FLOOD ANALYSIS & EMERGENCY PLANNING APP - FIXED CREDENTIALS
 # West Africa – Sentinel-1 (Assouplissements) / CHIRPS / WorldPop / OSM
 # ============================================================
 
@@ -45,7 +45,8 @@ def init_gee():
         st.stop()
     try:
         key = json.loads(st.secrets["GEE_SERVICE_ACCOUNT"])
-        credentials = ee.ServiceAccountCredential(key["client_email"], key_data=json.dumps(key))
+        # ✅ CORRECTION: ServiceAccountCredentials (avec 's')
+        credentials = ee.ServiceAccountCredentials(key["client_email"], key_data=json.dumps(key))
         ee.Initialize(credentials)
         return True
     except Exception as e:
