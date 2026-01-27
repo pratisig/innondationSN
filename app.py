@@ -29,7 +29,7 @@ def init_gee_singleton():
     """Initialise Google Earth Engine avec gestion robuste des secrets et du projet."""
     try:
         # Recherche des secrets dans Streamlit Cloud
-        secret_key = "gee_service_account"
+        secret_key = "GEE_SERVICE_ACCOUNT"
         if secret_key in st.secrets:
             try:
                 credentials_info = st.secrets[secret_key]
