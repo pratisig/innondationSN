@@ -1,5 +1,5 @@
 # ============================================================
-# FLOOD ANALYSIS & EMERGENCY PLANNING APP - FIXED S1
+# FLOOD ANALYSIS & EMERGENCY PLANNING APP - FIXED HASDATA
 # West Africa – Sentinel-1 (Assouplissements) / CHIRPS / WorldPop / OSM
 # ============================================================
 
@@ -45,7 +45,7 @@ def init_gee():
         st.stop()
     try:
         key = json.loads(st.secrets["GEE_SERVICE_ACCOUNT"])
-        credentials = ee.ServiceAccountCredentials(key["client_email"], key_data=json.dumps(key))
+        credentials = ee.ServiceAccountCredential(key["client_email"], key_data=json.dumps(key))
         ee.Initialize(credentials)
         return True
     except Exception as e:
@@ -57,7 +57,7 @@ init_gee()
 
 
 # ============================================================
-# PREDEFINED REGIONS (Sénégal exemple)
+# PREDEFINED REGIONS
 # ============================================================
 REGIONS_DATA = {
     "Senegal": {
@@ -265,8 +265,6 @@ def get_flood_detection(aoi_json, ref_start_str, ref_end_str, flood_start_str, f
     """
     aoi = ee.Geometry(aoi_json)
     
-    st.write(f"🔍 **Recherche Sentinel-1** pour {flood_start_str} → {flood_end_str}")
-    
     # ✅ ASSOUPLISSEMENT 1 : Accepter VV ET VH
     s1 = (ee.ImageCollection("COPERNICUS/S1_GRD")
           .filterBounds(aoi)
@@ -275,10 +273,8 @@ def get_flood_detection(aoi_json, ref_start_str, ref_end_str, flood_start_str, f
     
     # Évaluer le count - SANS filtrer par pass ou polarisation d'abord
     s1_count_all = safe_get_info(s1.size())
-    st.write(f"   → Images S1 trouvées (tous types) : {s1_count_all}")
     
     if s1_count_all is None or s1_count_all < 1:
-        st.error(f"❌ Aucune donnée Sentinel-1 pour cette période/région.")
         return None, None, 0
     
     # ✅ ASSOUPLISSEMENT 2 : Sélectionner VV si disponible, sinon VH
@@ -286,36 +282,43 @@ def get_flood_detection(aoi_json, ref_start_str, ref_end_str, flood_start_str, f
     s1_vv_count = safe_get_info(s1_vv.size())
     
     if s1_vv_count and s1_vv_count > 0:
-        st.write(f"   → Images VV trouvées : {s1_vv_count}")
         s1_selected = s1_vv.select("VV")
+        pol_used = "VV"
     else:
-        st.write("   ⚠️ Pas de VV, utilisation de VH...")
         s1_selected = s1.filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH")).select("VH")
-        s1_count_all = safe_get_info(s1_selected.size())
-        if not s1_count_all or s1_count_all < 1:
-            st.error("❌ Aucune polarisation (VV/VH) disponible.")
+        pol_used = "VH"
+        s1_vv_count = safe_get_info(s1_selected.size())
+        if not s1_vv_count or s1_vv_count < 1:
             return None, None, 0
     
-    # Image de référence (sèche)
-    ref_s1 = (ee.ImageCollection("COPERNICUS/S1_GRD")
-              .filterBounds(aoi)
-              .filterDate(ref_start_str, ref_end_str)
-              .filter(ee.Filter.eq("instrumentMode", "IW")))
-    
-    # Sélectionner même polarisation pour référence
-    if s1_vv_count and s1_vv_count > 0:
-        ref_img = ref_s1.filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")).select("VV").median()
-    else:
-        ref_img = ref_s1.filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH")).select("VH").median()
-    
-    crisis_img = s1_selected.median()
-    
-    # Vérifier que les images ont des données
-    ref_has_data = safe_get_info(ref_img.hasData())
-    crisis_has_data = safe_get_info(crisis_img.hasData())
-    
-    if not ref_has_data or not crisis_has_data:
-        st.error(f"❌ Données vides : ref={ref_has_data}, crisis={crisis_has_data}")
+    # ✅ CORRECTION 1 : Utiliser try/except et .reduceRegion() pour vérifier les données
+    try:
+        # Image de référence (sèche)
+        ref_s1 = (ee.ImageCollection("COPERNICUS/S1_GRD")
+                  .filterBounds(aoi)
+                  .filterDate(ref_start_str, ref_end_str)
+                  .filter(ee.Filter.eq("instrumentMode", "IW")))
+        
+        # Sélectionner même polarisation pour référence
+        if pol_used == "VV":
+            ref_img = ref_s1.filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")).select("VV").median()
+        else:
+            ref_img = ref_s1.filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH")).select("VH").median()
+        
+        crisis_img = s1_selected.median()
+        
+        # ✅ CORRECTION 2 : Vérifier les données avec .reduceRegion(count) au lieu de .hasData()
+        ref_pixel_count = safe_get_info(
+            ref_img.reduceRegion(ee.Reducer.count(), aoi, 300).get(pol_used)
+        )
+        crisis_pixel_count = safe_get_info(
+            crisis_img.reduceRegion(ee.Reducer.count(), aoi, 300).get(pol_used)
+        )
+        
+        if not ref_pixel_count or not crisis_pixel_count:
+            return None, None, s1_count_all
+        
+    except Exception as e:
         return None, None, s1_count_all
     
     # Conversion en dB
@@ -323,48 +326,52 @@ def get_flood_detection(aoi_json, ref_start_str, ref_end_str, flood_start_str, f
         clamped = img.max(ee.Image(-30))
         return ee.Image(10).multiply(clamped.log10())
     
-    ref_db = to_db(ref_img)
-    crisis_db = to_db(crisis_img)
-    
-    # Différence de backscatter
-    diff = ref_db.subtract(crisis_db)
-    
-    # Seuil inondation (eau = backscatter diminué)
-    flooded_raw = diff.gt(1.25)
-    
-    # Masque pente
     try:
-        dem = ee.Image("USGS/SRTMGL1_003")
-        slope = ee.Algorithms.Terrain(dem).select("slope")
-        mask_slope = slope.lt(5)
-    except:
-        mask_slope = ee.Image(1)
+        ref_db = to_db(ref_img)
+        crisis_db = to_db(crisis_img)
+        
+        # Différence de backscatter
+        diff = ref_db.subtract(crisis_db)
+        
+        # Seuil inondation (eau = backscatter diminué)
+        flooded_raw = diff.gt(1.25)
+        
+        # Masque pente
+        try:
+            dem = ee.Image("USGS/SRTMGL1_003")
+            slope = ee.Algorithms.Terrain(dem).select("slope")
+            mask_slope = slope.lt(5)
+        except:
+            mask_slope = ee.Image(1)
+        
+        # Masque eau permanente
+        try:
+            gsw = ee.Image("JRC/GSW1_4/GlobalSurfaceWater")
+            permanent_water = gsw.select("occurrence").gte(90)
+            mask_perm = permanent_water.Not()
+        except:
+            mask_perm = ee.Image(1)
+        
+        # Application des masques
+        flooded = (flooded_raw
+                   .updateMask(mask_slope)
+                   .updateMask(mask_perm)
+                   .selfMask())
+        
+        # Filtre connectivité
+        flooded = flooded.updateMask(flooded.connectedPixelCount(8).gte(5))
+        
+        # Précipitations CHIRPS
+        rain = (ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+                .filterBounds(aoi)
+                .filterDate(flood_start_str, flood_end_str)
+                .sum()
+                .rename('precip'))
+        
+        return flooded, rain, s1_count_all
     
-    # Masque eau permanente
-    try:
-        gsw = ee.Image("JRC/GSW1_4/GlobalSurfaceWater")
-        permanent_water = gsw.select("occurrence").gte(90)
-        mask_perm = permanent_water.Not()
-    except:
-        mask_perm = ee.Image(1)
-    
-    # Application des masques
-    flooded = (flooded_raw
-               .updateMask(mask_slope)
-               .updateMask(mask_perm)
-               .selfMask())
-    
-    # Filtre connectivité
-    flooded = flooded.updateMask(flooded.connectedPixelCount(8).gte(5))
-    
-    # Précipitations CHIRPS
-    rain = (ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
-            .filterBounds(aoi)
-            .filterDate(flood_start_str, flood_end_str)
-            .sum()
-            .rename('precip'))
-    
-    return flooded, rain, s1_count_all
+    except Exception as e:
+        return None, None, s1_count_all
 
 
 # ============================================================
@@ -405,7 +412,6 @@ def analyze_infrastructure_impact_osmnx(admin_polygon):
         }
     
     except Exception as e:
-        st.warning(f"⚠️ OSMnx ({str(e)[:40]})")
         return dict(buildings=0, roads_km=0, health=0, education=0)
 
 
@@ -416,12 +422,6 @@ st.subheader("🗺️ Analyse d'Impact Spatiale")
 
 with st.spinner("Analyse GEE & OSMnx en cours..."):
     
-    # ✅ Afficher progression
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    status_text.text("1/3 - Détection inondations (Sentinel-1)...")
-    
     # Obtenir mask d'inondation
     flood_all, rain_all, s1_count = get_flood_detection(
         geom_ee.getInfo(),
@@ -431,14 +431,10 @@ with st.spinner("Analyse GEE & OSMnx en cours..."):
         str(end_date)
     )
     
-    progress_bar.progress(33)
-    
     if flood_all is None or s1_count < 1:
         st.error(f"❌ Impossible de continuer (S1 count={s1_count}).")
         st.info("💡 **Suggestions:**\n- Élargir la plage temporelle\n- Changer de région\n- Utiliser 2023 au lieu de 2024")
         st.stop()
-    
-    status_text.text("2/3 - Population & analyse spatiale...")
     
     # Population WorldPop
     pop_img = (ee.ImageCollection("WorldPop/GP/100m/pop")
@@ -494,8 +490,6 @@ with st.spinner("Analyse GEE & OSMnx en cours..."):
         })
     
     df_res = pd.DataFrame(features_list)
-    progress_bar.progress(66)
-    status_text.text("3/3 - Cartographie...")
 
 
 # ─────────────────────────────────────────────────────────
@@ -510,9 +504,12 @@ try:
     
     # Overlay flood map
     try:
-        flood_has_data = safe_get_info(flood_all.hasData())
+        # ✅ CORRECTION 3 : Vérifier avec .reduceRegion(count) au lieu de .hasData()
+        flood_pixel_count = safe_get_info(
+            flood_all.select(0).reduceRegion(ee.Reducer.count(), geom_ee, 300).get('VV')
+        )
         
-        if flood_has_data:
+        if flood_pixel_count and flood_pixel_count > 0:
             flooded_binary = flood_all.select(0).unmask(0)
             flooded_vis = flooded_binary.visualize(min=0, max=1, palette=["white", "#0066FF"])
             map_id = flooded_vis.getMapId()
@@ -554,9 +551,6 @@ try:
 
 except Exception as e:
     st.error(f"❌ Carte : {e}")
-
-progress_bar.progress(100)
-status_text.text("✅ Analyse terminée!")
 
 
 # ─────────────────────────────────────────────────────────
