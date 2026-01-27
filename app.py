@@ -1,18 +1,21 @@
+# ===============================================================
+# FLOODWATCH WA – VERSION STABLE & CORRIGÉE
+# ===============================================================
+
 import streamlit as st
 import geopandas as gpd
 import folium
-from folium.plugins import Draw
 from streamlit_folium import st_folium
-import osmnx as ox
-from shapely.geometry import shape, mapping
-import json
 import ee
+import json
+import osmnx as ox
 import pandas as pd
 import plotly.express as px
+from shapely.geometry import mapping
 from datetime import datetime
 
 # ===============================================================
-# 1. CONFIGURATION
+# CONFIG
 # ===============================================================
 st.set_page_config(
     page_title="FloodWatch WA Pro",
@@ -20,219 +23,162 @@ st.set_page_config(
     layout="wide"
 )
 
-ox.settings.use_cache = True
-ox.settings.timeout = 180
-
 # ===============================================================
-# 2. INITIALISATION GEE
+# GEE INIT (SERVICE ACCOUNT OK)
 # ===============================================================
 @st.cache_resource
 def init_gee():
-    try:
-        if "GEE_SERVICE_ACCOUNT" in st.secrets:
-            key = json.loads(st.secrets["GEE_SERVICE_ACCOUNT"])
-            credentials = ee.ServiceAccountCredentials(
-                key["client_email"],
-                key_data=json.dumps(key)
-            )
-            ee.Initialize(credentials)
-        else:
-            ee.Initialize()
-        return True
-    except Exception as e:
-        st.error(f"GEE init error: {e}")
-        return False
+    key = json.loads(st.secrets["GEE_SERVICE_ACCOUNT"])
+    creds = ee.ServiceAccountCredentials(
+        key["client_email"],
+        key_data=json.dumps(key)
+    )
+    ee.Initialize(creds)
+    return True
 
-gee_available = init_gee()
+gee_ok = init_gee()
 
 # ===============================================================
-# 3. DONNÉES ADMIN
+# SESSION STATE
 # ===============================================================
-@st.cache_data(show_spinner=False)
+for k in ["results", "aoi_gdf"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
+
+# ===============================================================
+# LOAD GADM
+# ===============================================================
+@st.cache_data
 def load_gadm(iso, level):
     url = f"https://geodata.ucdavis.edu/gadm/gadm4.1/gpkg/gadm41_{iso}.gpkg"
-    return gpd.read_file(url, layer=level).to_crs(4326)
+    return gpd.read_file(url, layer=f"ADM_{level}").to_crs(4326)
 
 # ===============================================================
-# 4. DÉTECTION INONDATION SAR (AMÉLIORÉE)
+# FLOOD DETECTION (ROBUST)
 # ===============================================================
-def advanced_flood_detection(aoi, ref_start, ref_end, flood_start, flood_end,
-                             threshold_db=1.25, min_pixels=20):
+def detect_flood(aoi, d1, d2, d3, d4):
+    col = ee.ImageCollection("COPERNICUS/S1_GRD") \
+        .filterBounds(aoi) \
+        .filter(ee.Filter.eq("instrumentMode", "IW")) \
+        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")) \
+        .select("VV")
 
-    def s1(start, end):
-        return (ee.ImageCollection("COPERNICUS/S1_GRD")
-                .filterBounds(aoi)
-                .filterDate(start, end)
-                .filter(ee.Filter.eq("instrumentMode", "IW"))
-                .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
-                .select("VV"))
+    ref = col.filterDate(d1, d2).median()
+    crisis = col.filterDate(d3, d4).median()
 
-    ref = s1(ref_start, ref_end).median().clip(aoi)
-    crisis = s1(flood_start, flood_end).reduce(
-        ee.Reducer.percentile([10])
-    ).rename("VV").clip(aoi)
+    flood = ref.subtract(crisis).gt(1.2)
+    slope = ee.Terrain.slope(ee.Image("USGS/SRTMGL1_003"))
+    flood = flood.updateMask(slope.lt(5))
 
-    ref_db = ref.log10().multiply(10)
-    crisis_db = crisis.log10().multiply(10)
+    return flood.clip(aoi).selfMask()
 
-    flood = ref_db.subtract(crisis_db).gt(threshold_db)
+# ===============================================================
+# POPULATION (WORLDPOP 100m CORRECT)
+# ===============================================================
+def population_stats(aoi, flood):
+    pop = ee.ImageCollection("WorldPop/GP/100m/pop") \
+        .filterDate("2020-01-01", "2021-01-01") \
+        .mosaic() \
+        .clip(aoi)
 
-    slope = ee.Algorithms.Terrain(
-        ee.Image("USGS/SRTMGL1_003")
-    ).select("slope")
+    total = pop.reduceRegion(
+        ee.Reducer.sum(), aoi, 100, maxPixels=1e9
+    ).get("population").getInfo()
 
-    jrc = ee.Image("JRC/GSW1_4/GlobalSurfaceWater").select("occurrence")
+    exposed = pop.updateMask(flood).reduceRegion(
+        ee.Reducer.sum(), aoi, 100, maxPixels=1e9
+    ).get("population").getInfo()
 
-    flood = (
-        flood
-        .updateMask(slope.lt(5))
-        .updateMask(jrc.lt(80))
+    return int(total or 0), int(exposed or 0)
+
+# ===============================================================
+# OSM DATA
+# ===============================================================
+def load_osm(aoi_gdf):
+    poly = aoi_gdf.unary_union
+    buildings = ox.features_from_polygon(poly, tags={"building": True})
+    roads = ox.graph_to_gdfs(
+        ox.graph_from_polygon(poly, network_type="drive"),
+        nodes=False, edges=True
     )
-
-    flood = flood.focal_mode(1)
-    connected = flood.connectedPixelCount(100)
-    flood = flood.updateMask(connected.gte(min_pixels))
-
-    return flood.rename("flood").selfMask()
+    return buildings.to_crs(4326), roads.to_crs(4326)
 
 # ===============================================================
-# 5. POPULATION & SURFACE – POLYGONE PAR POLYGONE
+# SIDEBAR
 # ===============================================================
-def population_and_area_by_polygon(poly_geom, flood_mask):
-    pop_img = (
-        ee.ImageCollection("WorldPop/GP/100m/pop")
-        .filterDate("2020-01-01", "2021-01-01")
-        .mosaic()
-        .clip(poly_geom)
-    )
+with st.sidebar:
+    st.header("Zone d'étude")
 
-    total_pop = pop_img.reduceRegion(
-        ee.Reducer.sum(),
-        poly_geom,
-        scale=100,
-        maxPixels=1e9
-    ).get("population")
+    country = st.selectbox("Pays", {"Sénégal":"SEN","Mali":"MLI"})
+    level = st.slider("Niveau admin", 0, 3, 2)
 
-    exposed_pop = 0
-    flood_area = 0
+    gadm = load_gadm(country, level)
+    name_col = gadm.columns[gadm.columns.str.contains("NAME")][0]
+    choice = st.selectbox("Zone", gadm[name_col].unique())
 
-    if flood_mask:
-        flood_local = flood_mask.clip(poly_geom)
+    aoi = gadm[gadm[name_col] == choice]
+    st.session_state.aoi_gdf = aoi
 
-        exposed_pop = pop_img.updateMask(flood_local).reduceRegion(
-            ee.Reducer.sum(),
-            poly_geom,
-            scale=100,
-            maxPixels=1e9
-        ).get("population")
+    d_ref = st.date_input("Période sèche", [datetime(2023,1,1), datetime(2023,4,30)])
+    d_evt = st.date_input("Période inondation", [datetime(2024,8,1), datetime(2024,10,30)])
 
-        flood_area = flood_local.multiply(
-            ee.Image.pixelArea()
-        ).reduceRegion(
-            ee.Reducer.sum(),
-            poly_geom,
-            scale=10,
-            maxPixels=1e9
-        ).get("flood")
-
-    return (
-        int(total_pop.getInfo() or 0),
-        int(exposed_pop.getInfo() or 0),
-        float((flood_area.getInfo() or 0) / 10000)
-    )
+    run = st.button("🚀 Lancer analyse", type="primary")
 
 # ===============================================================
-# 6. OSM
+# ANALYSE
 # ===============================================================
-def get_osm_assets(gdf):
-    poly = gdf.unary_union
+if run:
+    aoi_ee = ee.Geometry(mapping(st.session_state.aoi_gdf.unary_union))
+    flood = detect_flood(aoi_ee, *map(str, d_ref), *map(str, d_evt))
 
-    buildings = ox.features_from_polygon(
-        poly, tags={"building": True}
-    )
-    buildings = buildings[
-        buildings.geometry.type.isin(["Polygon", "MultiPolygon"])
-    ].reset_index().clip(gdf)
+    total_pop, exp_pop = population_stats(aoi_ee, flood)
 
-    graph = ox.graph_from_polygon(poly, network_type="all")
-    roads = ox.graph_to_gdfs(graph, nodes=False, edges=True).reset_index().clip(gdf)
+    buildings, roads = load_osm(st.session_state.aoi_gdf)
 
-    return buildings, roads
-
-# ===============================================================
-# 7. INTERFACE
-# ===============================================================
-st.sidebar.header("🗺️ Zone")
-countries = {"Sénégal": "SEN", "Mali": "MLI", "Niger": "NER", "Burkina Faso": "BFA"}
-country = st.sidebar.selectbox("Pays", list(countries))
-level = st.sidebar.slider("Niveau Admin", 0, 4, 2)
-
-gdf_admin = load_gadm(countries[country], level)
-name_col = f"NAME_{level}" if level > 0 else "COUNTRY"
-choice = st.sidebar.multiselect("Zone(s)", sorted(gdf_admin[name_col].unique()))
-zone = gdf_admin[gdf_admin[name_col].isin(choice)] if choice else None
-
-st.sidebar.header("📅 Dates")
-ref = st.sidebar.date_input("Référence sèche", [datetime(2023,1,1), datetime(2023,4,30)])
-flood = st.sidebar.date_input("Crise", [datetime(2024,8,1), datetime(2024,10,31)])
-
-sens = st.sidebar.slider("Sensibilité SAR (dB)", 0.5, 5.0, 1.25)
+    st.session_state.results = {
+        "flood": flood.getMapId({"palette":["#0000FF"]}),
+        "total_pop": total_pop,
+        "exp_pop": exp_pop,
+        "buildings": buildings,
+        "roads": roads
+    }
 
 # ===============================================================
-# 8. ANALYSE
+# DISPLAY RESULTS (STABLE)
 # ===============================================================
-st.title("🌊 FloodWatch WA – Analyse SAR précise")
+if st.session_state.results:
+    r = st.session_state.results
 
-if zone is not None and st.button("🚀 Lancer l'analyse", use_container_width=True):
+    c1,c2,c3 = st.columns(3)
+    c1.metric("Population totale", f"{r['total_pop']:,}")
+    c2.metric("Population impactée", f"{r['exp_pop']:,}")
+    c3.metric("Bâtiments", len(r["buildings"]))
 
-    with st.spinner("Analyse GEE en cours..."):
-        aoi = ee.Geometry(mapping(zone.unary_union))
-        flood_mask = advanced_flood_detection(
-            aoi,
-            str(ref[0]), str(ref[1]),
-            str(flood[0]), str(flood[1]),
-            sens
-        )
+    center = st.session_state.aoi_gdf.centroid.iloc[0]
+    m = folium.Map([center.y, center.x], zoom_start=11)
 
-        total_pop = exposed_pop = total_area = 0
+    folium.GeoJson(st.session_state.aoi_gdf).add_to(m)
 
-        for _, row in zone.iterrows():
-            geom = ee.Geometry(mapping(row.geometry))
-            t, e, a = population_and_area_by_polygon(geom, flood_mask)
-            total_pop += t
-            exposed_pop += e
-            total_area += a
+    folium.TileLayer(
+        tiles=r["flood"]["tile_fetcher"].url_format,
+        attr="GEE Flood",
+        name="Inondation"
+    ).add_to(m)
 
-        buildings, roads = get_osm_assets(zone)
+    folium.GeoJson(
+        r["buildings"],
+        style_function=lambda x: {"color":"red","weight":1},
+        name="Bâtiments"
+    ).add_to(m)
 
-    # ===========================================================
-    # KPI
-    # ===========================================================
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Population totale", f"{total_pop:,}")
-    c2.metric("Population exposée", f"{exposed_pop:,}", f"{exposed_pop/total_pop*100:.1f}%")
-    c3.metric("Surface inondée", f"{total_area:,.1f} ha")
-    c4.metric("Bâtiments", len(buildings))
+    folium.GeoJson(
+        r["roads"],
+        style_function=lambda x: {"color":"red","weight":2},
+        name="Routes"
+    ).add_to(m)
 
-    # ===========================================================
-    # CARTE
-    # ===========================================================
-    center = zone.centroid.iloc[0]
-    m = folium.Map([center.y, center.x], zoom_start=11, tiles="cartodbpositron")
-
-    try:
-        mid = flood_mask.getMapId({"palette": ["#00bfff"]})
-        folium.TileLayer(
-            tiles=mid["tile_fetcher"].url_format,
-            name="Inondation",
-            overlay=True
-        ).add_to(m)
-    except:
-        pass
-
-    folium.GeoJson(zone, name="Zone").add_to(m)
     folium.LayerControl().add_to(m)
-    st_folium(m, height=600, use_container_width=True)
+    st_folium(m, height=650, width="100%")
 
 else:
-    st.info("Sélectionne une zone et lance l'analyse.")
+    st.info("Sélectionne une zone et lance l’analyse.")
