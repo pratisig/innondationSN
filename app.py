@@ -29,7 +29,7 @@ def init_gee_singleton():
     """Initialise Google Earth Engine avec gestion robuste des secrets et du projet."""
     try:
         # Recherche des secrets dans Streamlit Cloud
-        secret_key = "GEE_SERVICE_ACCOUNT"
+        secret_key = "gee_service_account"
         if secret_key in st.secrets:
             try:
                 credentials_info = st.secrets[secret_key]
@@ -116,14 +116,17 @@ def get_pop_stats_cached(aoi_json):
         aoi_ee = ee.Geometry(aoi_json)
         pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").median().clip(aoi_ee)
         
-        total_pop = pop_img.reduceRegion(
+        # Utilisation d'une extraction de dictionnaire plus sûre
+        stats = pop_img.reduceRegion(
             reducer=ee.Reducer.sum(),
             geometry=aoi_ee,
             scale=100,
             maxPixels=1e13
-        ).get('population').getInfo()
+        ).getInfo()
+        
+        total_pop = list(stats.values())[0] if stats else 0
         return int(total_pop) if total_pop else 0
-    except:
+    except Exception as e:
         return 0
 
 @st.cache_data(show_spinner=False)
@@ -223,25 +226,33 @@ if st.session_state.selected_zone is not None:
                 # 1. Détection Inondation
                 flood_img = detect_flood(aoi_ee, str(d_ref[0]), str(d_ref[1]), str(d_flood[0]), str(d_flood[1]))
                 
-                # 2. Population
+                # 2. Population Totale
                 t_pop = get_pop_stats_cached(aoi_json)
                 
+                # 3. Population Impactée
                 e_pop = 0
                 if flood_img:
-                    pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").median().clip(aoi_ee)
-                    e_pop_val = pop_img.updateMask(flood_img).reduceRegion(
-                        reducer=ee.Reducer.sum(), geometry=aoi_ee, scale=100, maxPixels=1e13
-                    ).get('population').getInfo()
-                    e_pop = int(e_pop_val) if e_pop_val else 0
+                    try:
+                        pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").median().clip(aoi_ee)
+                        e_pop_stats = pop_img.updateMask(flood_img).reduceRegion(
+                            reducer=ee.Reducer.sum(), 
+                            geometry=aoi_ee, 
+                            scale=100, 
+                            maxPixels=1e13
+                        ).getInfo()
+                        e_pop_val = list(e_pop_stats.values())[0] if e_pop_stats else 0
+                        e_pop = int(e_pop_val) if e_pop_val else 0
+                    except:
+                        e_pop = 0
                 
-                # 3. Infrastructures OSM
+                # 4. Infrastructures OSM
                 b_json, r_json = get_osm_assets_cached(aoi_json)
                 
-                # 4. Climat
+                # 5. Climat
                 centroid = geom_union.centroid
                 df_clim_json = get_climate_data([centroid.x, centroid.y], str(d_flood[0]), str(d_flood[1]))
                 
-                # 5. Surface & MapId
+                # 6. Surface & MapId
                 area_ha = 0
                 mask_id = None
                 if flood_img:
