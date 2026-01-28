@@ -23,48 +23,37 @@ st.set_page_config(
     layout="wide"
 )
 
-# Initialisation GEE optimisée avec gestion du Project ID
-@st.cache_resource
-def init_gee_singleton():
-    """Initialise Google Earth Engine avec gestion robuste des secrets et du projet."""
+# Fonction d'initialisation robuste réutilisable
+def ensure_gee():
+    """Vérifie et initialise GEE si nécessaire avant chaque opération critique."""
     try:
-        # Recherche des secrets dans Streamlit Cloud
-        secret_key = "GEE_SERVICE_ACCOUNT"
-        if secret_key in st.secrets:
-            try:
-                credentials_info = st.secrets[secret_key]
-                
-                # Streamlit peut fournir le secret comme dict ou comme chaîne JSON
-                if isinstance(credentials_info, str):
-                    credentials_info = json.loads(credentials_info)
-                
-                # Extraction du Project ID (Crucial pour les nouvelles API Cloud)
-                project_id = credentials_info.get('project_id')
-                
-                # Conversion des secrets en credentials GEE
-                credentials = ee.ServiceAccountCredentials(
-                    credentials_info['client_email'],
-                    key_data=json.dumps(credentials_info)
-                )
-                
-                # Initialisation avec le projet spécifié
-                if project_id:
-                    ee.Initialize(credentials, project=project_id)
-                else:
-                    ee.Initialize(credentials)
-                return True
-            except Exception as e:
-                st.error(f"Erreur d'authentification GEE : {e}")
-                return False
-        else:
-            # Tentative d'initialisation par défaut (environnement local)
-            ee.Initialize()
+        # Si déjà initialisé avec un projet, on ne fait rien
+        return True
+    except:
+        pass
+        
+    secret_key = "gee_service_account"
+    if secret_key in st.secrets:
+        try:
+            creds = st.secrets[secret_key]
+            if isinstance(creds, str):
+                creds = json.loads(creds)
+            
+            project_id = creds.get('project_id')
+            ee_creds = ee.ServiceAccountCredentials(creds['client_email'], key_data=json.dumps(creds))
+            
+            if project_id:
+                ee.Initialize(ee_creds, project=project_id)
+            else:
+                ee.Initialize(ee_creds)
             return True
-    except Exception as e:
-        st.warning(f"GEE non disponible : {e}")
-        return False
+        except Exception as e:
+            st.error(f"Erreur d'initialisation GEE : {e}")
+            return False
+    return False
 
-gee_available = init_gee_singleton()
+# Initialisation au démarrage
+gee_available = ensure_gee()
 
 if 'results' not in st.session_state:
     st.session_state.results = None
@@ -87,7 +76,7 @@ def load_gadm(iso, level):
         return None
 
 def detect_flood(aoi, d1, d2, d3, d4, threshold=-1.25):
-    if not gee_available: return None
+    if not ensure_gee(): return None
     try:
         s1 = (ee.ImageCollection("COPERNICUS/S1_GRD")
               .filterBounds(aoi)
@@ -99,34 +88,30 @@ def detect_flood(aoi, d1, d2, d3, d4, threshold=-1.25):
         flood = s1.filterDate(d3, d4).median()
 
         diff = flood.subtract(ref)
-        # On nomme explicitement la bande pour le calcul de stats plus tard
         flood_mask = diff.lt(threshold).rename('flood_mask')
 
         slope = ee.Algorithms.Terrain(ee.Image("USGS/SRTMGL1_003")).select('slope')
         flood_mask = flood_mask.updateMask(slope.lt(5))
 
         return flood_mask.selfMask().clip(aoi)
-    except Exception as e:
+    except Exception:
         return None
 
 @st.cache_data(show_spinner=False)
 def get_pop_stats_cached(aoi_json):
-    if not gee_available: return 0
+    if not ensure_gee(): return 0
     try:
         aoi_ee = ee.Geometry(aoi_json)
         pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").median().clip(aoi_ee)
-        
-        # Utilisation d'une extraction de dictionnaire plus sûre
         stats = pop_img.reduceRegion(
             reducer=ee.Reducer.sum(),
             geometry=aoi_ee,
             scale=100,
             maxPixels=1e13
         ).getInfo()
-        
         total_pop = list(stats.values())[0] if stats else 0
         return int(total_pop) if total_pop else 0
-    except Exception as e:
+    except:
         return 0
 
 @st.cache_data(show_spinner=False)
@@ -137,7 +122,6 @@ def get_climate_data(centroid_coords, start, end):
         url = (f"https://power.larc.nasa.gov/api/temporal/daily/point?"
                f"latitude={centroid_coords[1]}&longitude={centroid_coords[0]}&start={s_date}&end={e_date}"
                f"&parameters=PRECTOTCORR,T2M&community=AG&format=JSON")
-        
         resp = requests.get(url, timeout=10).json()
         params = resp["properties"]["parameter"]
         df = pd.DataFrame({
@@ -153,20 +137,16 @@ def get_climate_data(centroid_coords, start, end):
 def get_osm_assets_cached(aoi_json):
     try:
         geom = shape(aoi_json)
-        # Bâtiments
         try: 
             b = ox.features_from_polygon(geom, tags={'building': True})
             b = b[b.geometry.type.isin(['Polygon', 'MultiPolygon'])].reset_index()
             b_json = b.to_json()
         except: b_json = None
-        
-        # Routes
         try:
             graph = ox.graph_from_polygon(geom, network_type='all')
             r = ox.graph_to_gdfs(graph, nodes=False, edges=True).reset_index()
             r_json = r.to_json()
         except: r_json = None
-        
         return b_json, r_json
     except:
         return None, None
@@ -215,62 +195,51 @@ st.title(f"🌊 FloodWatch WA : {st.session_state.zone_name}")
 
 if st.session_state.selected_zone is not None:
     if st.button("🚀 LANCER L'ANALYSE D'IMPACT", type="primary", use_container_width=True):
-        if not gee_available:
-            st.error("L'analyse satellite (GEE) est désactivée. Vérifiez vos secrets 'gee_service_account' et assurez-vous que 'project_id' y figure.")
+        if not ensure_gee():
+            st.error("L'analyse satellite (GEE) est désactivée. Vérifiez vos secrets 'gee_service_account'.")
         else:
             with st.spinner("Analyse en cours..."):
                 geom_union = st.session_state.selected_zone.unary_union
                 aoi_json = mapping(geom_union)
                 aoi_ee = ee.Geometry(aoi_json)
                 
-                # 1. Détection Inondation
                 flood_img = detect_flood(aoi_ee, str(d_ref[0]), str(d_ref[1]), str(d_flood[0]), str(d_flood[1]))
-                
-                # 2. Population Totale
                 t_pop = get_pop_stats_cached(aoi_json)
                 
-                # 3. Population Impactée
                 e_pop = 0
                 if flood_img:
                     try:
                         pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").median().clip(aoi_ee)
                         e_pop_stats = pop_img.updateMask(flood_img).reduceRegion(
-                            reducer=ee.Reducer.sum(), 
-                            geometry=aoi_ee, 
-                            scale=100, 
-                            maxPixels=1e13
+                            reducer=ee.Reducer.sum(), geometry=aoi_ee, scale=100, maxPixels=1e13
                         ).getInfo()
                         e_pop_val = list(e_pop_stats.values())[0] if e_pop_stats else 0
                         e_pop = int(e_pop_val) if e_pop_val else 0
-                    except:
-                        e_pop = 0
+                    except: e_pop = 0
                 
-                # 4. Infrastructures OSM
                 b_json, r_json = get_osm_assets_cached(aoi_json)
-                
-                # 5. Climat
                 centroid = geom_union.centroid
                 df_clim_json = get_climate_data([centroid.x, centroid.y], str(d_flood[0]), str(d_flood[1]))
                 
-                # 6. Surface & MapId
                 area_ha = 0
-                mask_id = None
+                mask_url = None
                 if flood_img:
-                    mask_id = flood_img.getMapId({'palette': ['#00BFFF']})
-                    # On réduit la région sur la bande 'flood_mask'
-                    stats = flood_img.multiply(ee.Image.pixelArea()).reduceRegion(
-                        reducer=ee.Reducer.sum(), 
-                        geometry=aoi_ee, 
-                        scale=10, 
-                        maxPixels=1e9
-                    ).getInfo()
-                    # On récupère la valeur de la première bande disponible
-                    area_px = list(stats.values())[0] if stats else 0
-                    area_ha = (area_px / 10000) if area_px else 0
+                    try:
+                        # Utilisation directe du MapId avec projet explicite
+                        map_info = flood_img.getMapId({'palette': ['#00BFFF']})
+                        mask_url = map_info['tile_fetcher'].url_format
+                        
+                        stats = flood_img.multiply(ee.Image.pixelArea()).reduceRegion(
+                            reducer=ee.Reducer.sum(), geometry=aoi_ee, scale=10, maxPixels=1e9
+                        ).getInfo()
+                        area_px = list(stats.values())[0] if stats else 0
+                        area_ha = (area_px / 10000) if area_px else 0
+                    except Exception as e:
+                        st.warning(f"Note: Impossible d'extraire la surface ou la carte ({e})")
 
                 st.session_state.results = {
                     't_pop': t_pop, 'e_pop': e_pop, 'p_pop': (e_pop/t_pop*100) if t_pop > 0 else 0,
-                    'area': area_ha, 'mask_id': mask_id, 'df_clim_json': df_clim_json,
+                    'area': area_ha, 'mask_url': mask_url, 'df_clim_json': df_clim_json,
                     'b_geo': b_json, 'r_geo': r_json
                 }
 
@@ -282,14 +251,14 @@ if st.session_state.selected_zone is not None:
         b_count = len(json.loads(res['b_geo'])['features']) if res['b_geo'] else 0
         r_count = len(json.loads(res['r_geo'])['features']) if res['r_geo'] else 0
         m3.metric("Bâtiments", b_count)
-        m4.metric("Routes (Segments)", r_count)
+        m4.metric("Routes", r_count)
 
         tab1, tab2 = st.tabs(["🗺️ Cartographie", "📊 Climat"])
         with tab1:
             center = st.session_state.selected_zone.centroid.iloc[0]
             m = folium.Map(location=[center.y, center.x], zoom_start=12, tiles="cartodbpositron")
-            if res['mask_id']:
-                folium.TileLayer(tiles=res['mask_id']['tile_fetcher'].url_format, attr='GEE', name='Inondation', overlay=True).add_to(m)
+            if res['mask_url']:
+                folium.TileLayer(tiles=res['mask_url'], attr='GEE Flood Mask', name='Inondation', overlay=True).add_to(m)
             if res['b_geo']:
                 folium.GeoJson(res['b_geo'], name="Bâtiments", style_function=lambda x: {'fillColor': 'red', 'color': 'darkred', 'weight': 1}).add_to(m)
             if res['r_geo']:
