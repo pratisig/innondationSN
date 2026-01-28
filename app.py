@@ -119,8 +119,6 @@ def get_osm_impact(aoi_json, flood_mask_ee):
         r_gdf = r_raw[r_raw.geometry.type.isin(['LineString', 'MultiLineString'])].copy()
         
         # Conversion du masque flood_mask en vecteur pour intersection spatiale
-        # Note : pour de grandes zones, cette opération est coûteuse.
-        # Alternative : échantillonnage ponctuel.
         flood_vec = flood_mask_ee.reduceToVectors(geometry=ee.Geometry(aoi_json), scale=20, maxPixels=1e9)
         flood_geom = shape(flood_vec.geometry().getInfo())
         
@@ -223,12 +221,22 @@ if st.session_state.selected_zone is not None:
     if st.session_state.results:
         res = st.session_state.results
         
+        # Extraction sécurisée des comptes d'infrastructures
+        def safe_feature_count(geojson_str):
+            if not geojson_str: return 0
+            try:
+                data = json.loads(geojson_str)
+                return len(data.get('features', []))
+            except:
+                return 0
+
+        bh = safe_feature_count(res.get('b_hit'))
+        rh = safe_feature_count(res.get('r_hit'))
+
         # Métriques
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Surface Inondée", f"{res['area']:.1f} ha")
         c2.metric("Population Zone", f"{res['t_pop']:,}")
-        bh = len(json.loads(res['b_hit'])['features']) if res['b_hit'] else 0
-        rh = len(json.loads(res['r_hit'])['features']) if res['r_hit'] else 0
         c3.metric("Bâtiments Touchés", bh)
         c4.metric("Routes Touchées", rh)
 
@@ -241,7 +249,6 @@ if st.session_state.selected_zone is not None:
             if res['mask_url']:
                 folium.TileLayer(tiles=res['mask_url'], attr='GEE', name='Masque Inondation', overlay=True, opacity=0.7).add_to(m)
             
-            # Affichage Infrastructures (Base en gris, Touchées en rouge)
             if res['b_all']:
                 folium.GeoJson(res['b_all'], name="Bâtiments (Total)", style_function=lambda x: {'color': 'gray', 'weight': 0.5, 'fillOpacity': 0.1}).add_to(m)
             if res['b_hit']:
@@ -255,11 +262,8 @@ if st.session_state.selected_zone is not None:
         with tab2:
             if res['df_clim']:
                 df = pd.read_json(res['df_clim'])
-                # Création du graphique ombrothermique
                 fig = go.Figure()
-                # Barres pour les précipitations
                 fig.add_trace(go.Bar(x=df['date'], y=df['Pluie'], name="Précipitations (mm)", marker_color='blue', yaxis='y1'))
-                # Ligne pour la température
                 fig.add_trace(go.Scatter(x=df['date'], y=df['Température'], name="Température (°C)", line=dict(color='red', width=2), yaxis='y2'))
                 
                 fig.update_layout(
