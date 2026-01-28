@@ -23,6 +23,10 @@ st.set_page_config(
     layout="wide"
 )
 
+# Paramètres OSMnx
+ox.settings.timeout = 180
+ox.settings.use_cache = True
+
 def ensure_gee():
     """Vérifie et initialise GEE avec gestion du projet Cloud."""
     try:
@@ -60,7 +64,10 @@ if 'zone_name' not in st.session_state:
 # ═════════════════════════════════════════════════════════════════
 
 def detect_flood_refined(aoi, d1, d2, d3, d4, threshold=-1.25):
-    """Détection affinée pour éviter la surestimation."""
+    """
+    Détection affinée pour éviter la surestimation (méthode de différence de log).
+    Intègre un filtre de pente et un masque d'eau permanente.
+    """
     if not ensure_gee(): return None
     try:
         # Collection Sentinel-1
@@ -79,16 +86,15 @@ def detect_flood_refined(aoi, d1, d2, d3, d4, threshold=-1.25):
         # Masquage initial (seuil radar)
         flood_mask = diff.lt(threshold)
         
-        # 1. Filtre de pente (SRTM) : Supprime les ombres radar en zone montagneuse
+        # 1. Filtre de pente (SRTM) : Supprime les ombres radar en zone montagneuse (> 5 degrés)
         slope = ee.Algorithms.Terrain(ee.Image("USGS/SRTMGL1_003")).select('slope')
         flood_mask = flood_mask.updateMask(slope.lt(5))
         
-        # 2. Masque d'eau permanente (JRC) : Ne garder que l'eau 'nouvelle'
+        # 2. Masque d'eau permanente (JRC) : Supprime l'eau déjà existante
         jrc = ee.Image("JRC/GSW1_4/GlobalSurfaceWater").select('occurrence')
         flood_mask = flood_mask.updateMask(jrc.lt(10))
         
-        # 3. Nettoyage Morphologique (Suppression du bruit/pixels isolés)
-        # Ouverture : érosion puis dilatation
+        # 3. Nettoyage Morphologique (Suppression du bruit)
         kernel = ee.Kernel.circle(radius=1)
         flood_mask = flood_mask.focal_min(kernel).focal_max(kernel).rename('flood')
         
@@ -97,14 +103,22 @@ def detect_flood_refined(aoi, d1, d2, d3, d4, threshold=-1.25):
         return None
 
 @st.cache_data(show_spinner=False)
-def get_pop_stats_cached(aoi_json):
-    if not ensure_gee(): return 0
+def get_pop_stats_cached(aoi_json, flood_mask_ee=None):
+    if not ensure_gee(): return 0, 0
     try:
         aoi_ee = ee.Geometry(aoi_json)
         pop_img = ee.ImageCollection("WorldPop/GP/100m/pop").median().clip(aoi_ee)
-        stats = pop_img.reduceRegion(reducer=ee.Reducer.sum(), geometry=aoi_ee, scale=100, maxPixels=1e13).getInfo()
-        return int(list(stats.values())[0]) if stats else 0
-    except: return 0
+        
+        total_stats = pop_img.reduceRegion(reducer=ee.Reducer.sum(), geometry=aoi_ee, scale=100, maxPixels=1e13).getInfo()
+        total_pop = int(list(total_stats.values())[0]) if total_stats else 0
+        
+        exposed_pop = 0
+        if flood_mask_ee:
+            exp_stats = pop_img.updateMask(flood_mask_ee).reduceRegion(reducer=ee.Reducer.sum(), geometry=aoi_ee, scale=100, maxPixels=1e13).getInfo()
+            exposed_pop = int(list(exp_stats.values())[0]) if exp_stats else 0
+            
+        return total_pop, exposed_pop
+    except: return 0, 0
 
 @st.cache_data(show_spinner=False)
 def get_osm_impact(aoi_json, flood_mask_ee):
@@ -119,10 +133,11 @@ def get_osm_impact(aoi_json, flood_mask_ee):
         r_gdf = r_raw[r_raw.geometry.type.isin(['LineString', 'MultiLineString'])].copy()
         
         # Conversion du masque flood_mask en vecteur pour intersection spatiale
-        flood_vec = flood_mask_ee.reduceToVectors(geometry=ee.Geometry(aoi_json), scale=20, maxPixels=1e9)
+        # On utilise une échelle réduite pour la performance
+        flood_vec = flood_mask_ee.reduceToVectors(geometry=ee.Geometry(aoi_json), scale=40, maxPixels=1e9)
         flood_geom = shape(flood_vec.geometry().getInfo())
         
-        # Intersection spatiale (Infrastructures touchées)
+        # Intersection spatiale
         b_impact = b_gdf[b_gdf.intersects(flood_geom)].copy()
         r_impact = r_gdf[r_gdf.intersects(flood_geom)].copy()
         
@@ -132,13 +147,14 @@ def get_osm_impact(aoi_json, flood_mask_ee):
 
 @st.cache_data(show_spinner=False)
 def get_climate_data(centroid_coords, start, end):
+    """Récupère les données NASA POWER pour le graphique ombrothermique."""
     try:
         s_date = start.replace("-", "")
         e_date = end.replace("-", "")
         url = (f"https://power.larc.nasa.gov/api/temporal/daily/point?"
                f"latitude={centroid_coords[1]}&longitude={centroid_coords[0]}&start={s_date}&end={e_date}"
                f"&parameters=PRECTOTCORR,T2M&community=AG&format=JSON")
-        resp = requests.get(url, timeout=10).json()
+        resp = requests.get(url, timeout=15).json()
         params = resp["properties"]["parameter"]
         df = pd.DataFrame({
             'date': pd.to_datetime(list(params["PRECTOTCORR"].keys()), format='%Y%m%d'),
@@ -168,35 +184,35 @@ with st.sidebar:
             if choices:
                 st.session_state.selected_zone = gdf_base[gdf_base[col].isin(choices)].copy()
                 st.session_state.zone_name = ", ".join(choices)
-        except: st.error("Erreur GADM")
+        except: st.error("Erreur de chargement GADM.")
 
-    st.subheader("📅 Périodes")
+    st.subheader("📅 Périodes radar")
     d_ref = st.date_input("Référence (Sec)", [datetime(2023, 1, 1), datetime(2023, 3, 30)])
-    d_flood = st.date_input("Analyse (Pluies)", [datetime(2024, 8, 1), datetime(2024, 10, 30)])
+    d_flood = st.date_input("Analyse (Inondation)", [datetime(2024, 8, 1), datetime(2024, 10, 30)])
 
-st.title(f"🌊 FloodWatch WA : {st.session_state.zone_name}")
+st.title(f"🌊 FloodWatch WA Pro : {st.session_state.zone_name}")
 
 if st.session_state.selected_zone is not None:
-    if st.button("🚀 ANALYSER L'IMPACT", type="primary", use_container_width=True):
-        with st.spinner("Analyse satellite et spatiale en cours..."):
+    if st.button("🚀 LANCER L'ANALYSE D'IMPACT", type="primary", use_container_width=True):
+        with st.spinner("Traitement satellite et spatial en cours..."):
             geom_union = st.session_state.selected_zone.unary_union
             aoi_json = mapping(geom_union)
             aoi_ee = ee.Geometry(aoi_json)
             
-            # 1. Détection inondation affinée
+            # 1. Détection inondation affinée (Correction surestimation)
             flood_mask = detect_flood_refined(aoi_ee, str(d_ref[0]), str(d_ref[1]), str(d_flood[0]), str(d_flood[1]))
             
             # 2. Stats Population
-            t_pop = get_pop_stats_cached(aoi_json)
+            t_pop, e_pop = get_pop_stats_cached(aoi_json, flood_mask)
             
-            # 3. Analyse Infrastructures
+            # 3. Analyse Infrastructures (OSM)
             b_all, b_hit, r_all, r_hit = get_osm_impact(aoi_json, flood_mask)
             
-            # 4. Climat
+            # 4. Données Climatiques
             centroid = geom_union.centroid
             df_clim = get_climate_data([centroid.x, centroid.y], str(d_flood[0]), str(d_flood[1]))
             
-            # 5. Calcul Surface Inondée
+            # 5. Calcul Surface
             area_ha = 0
             mask_url = None
             if flood_mask:
@@ -210,6 +226,7 @@ if st.session_state.selected_zone is not None:
             st.session_state.results = {
                 'area': area_ha,
                 't_pop': t_pop,
+                'e_pop': e_pop,
                 'mask_url': mask_url,
                 'df_clim': df_clim,
                 'b_all': b_all.to_json() if b_all is not None else None,
@@ -221,74 +238,95 @@ if st.session_state.selected_zone is not None:
     if st.session_state.results:
         res = st.session_state.results
         
-        # Extraction sécurisée des comptes d'infrastructures
-        def safe_feature_count(geojson_str):
+        def safe_count(geojson_str):
             if not geojson_str: return 0
-            try:
-                data = json.loads(geojson_str)
-                return len(data.get('features', []))
-            except:
-                return 0
+            try: return len(json.loads(geojson_str).get('features', []))
+            except: return 0
 
-        bh = safe_feature_count(res.get('b_hit'))
-        rh = safe_feature_count(res.get('r_hit'))
+        bh = safe_count(res.get('b_hit'))
+        rh = safe_count(res.get('r_hit'))
 
-        # Métriques
+        # KPIs
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Surface Inondée", f"{res['area']:.1f} ha")
-        c2.metric("Population Zone", f"{res['t_pop']:,}")
-        c3.metric("Bâtiments Touchés", bh)
-        c4.metric("Routes Touchées", rh)
+        c2.metric("Population Exposée", f"{res['e_pop']:,}", f"{ (res['e_pop']/res['t_pop']*100 if res['t_pop']>0 else 0):.1f}%")
+        c3.metric("Bâtiments Touchés", bh, delta_color="inverse")
+        c4.metric("Segments Routes", rh, delta_color="inverse")
 
-        tab1, tab2, tab3 = st.tabs(["🗺️ Carte d'Impact", "📊 Graphique Ombrothermique", "📥 Exportation"])
+        tab1, tab2, tab3 = st.tabs(["🗺️ Cartographie d'Impact", "📊 Analyse Climatique", "📥 Exportations"])
         
         with tab1:
             center = st.session_state.selected_zone.centroid.iloc[0]
             m = folium.Map(location=[center.y, center.x], zoom_start=12, tiles="cartodbpositron")
             
+            # Masque Inondation
             if res['mask_url']:
-                folium.TileLayer(tiles=res['mask_url'], attr='GEE', name='Masque Inondation', overlay=True, opacity=0.7).add_to(m)
+                folium.TileLayer(tiles=res['mask_url'], attr='GEE', name='Masque Inondation', overlay=True, opacity=0.6).add_to(m)
+            
+            # Couches Infrastructures
+            if res['b_hit']:
+                folium.GeoJson(res['b_hit'], name="Bâtiments IMPACTÉS (Rouge)", 
+                               style_function=lambda x: {'color': '#e74c3c', 'fillColor': '#e74c3c', 'weight': 1, 'fillOpacity': 0.8}).add_to(m)
+            if res['r_hit']:
+                folium.GeoJson(res['r_hit'], name="Routes IMPACTÉES (Rouge)", 
+                               style_function=lambda x: {'color': '#c0392b', 'weight': 4, 'opacity': 0.9}).add_to(m)
             
             if res['b_all']:
-                folium.GeoJson(res['b_all'], name="Bâtiments (Total)", style_function=lambda x: {'color': 'gray', 'weight': 0.5, 'fillOpacity': 0.1}).add_to(m)
-            if res['b_hit']:
-                folium.GeoJson(res['b_hit'], name="Bâtiments IMPACTÉS", style_function=lambda x: {'color': 'red', 'fillColor': 'red', 'weight': 1, 'fillOpacity': 0.8}).add_to(m)
-            if res['r_hit']:
-                folium.GeoJson(res['r_hit'], name="Routes IMPACTÉES", style_function=lambda x: {'color': 'darkred', 'weight': 3}).add_to(m)
+                folium.GeoJson(res['b_all'], name="Bâtiments (Total)", show=False,
+                               style_function=lambda x: {'color': 'gray', 'weight': 0.5, 'fillOpacity': 0.1}).add_to(m)
             
             folium.LayerControl().add_to(m)
-            st_folium(m, width="100%", height=600)
+            st_folium(m, width="100%", height=600, key="main_map")
 
         with tab2:
             if res['df_clim']:
                 df = pd.read_json(res['df_clim'])
+                
+                # Indicateurs météo moyens
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric("Cumul Précipitations", f"{df['Pluie'].sum():.1f} mm")
+                mc2.metric("Température Moyenne", f"{df['Température'].mean():.1f} °C")
+                mc3.metric("Jour le plus pluvieux", df.loc[df['Pluie'].idxmax(), 'date'].strftime('%d/%m/%Y'))
+
+                # Graphique Ombrothermique
                 fig = go.Figure()
-                fig.add_trace(go.Bar(x=df['date'], y=df['Pluie'], name="Précipitations (mm)", marker_color='blue', yaxis='y1'))
-                fig.add_trace(go.Scatter(x=df['date'], y=df['Température'], name="Température (°C)", line=dict(color='red', width=2), yaxis='y2'))
+                fig.add_trace(go.Bar(x=df['date'], y=df['Pluie'], name="Précipitations (mm)", marker_color='#3498db', yaxis='y1'))
+                fig.add_trace(go.Scatter(x=df['date'], y=df['Température'], name="Température (°C)", line=dict(color='#e67e22', width=3), yaxis='y2'))
                 
                 fig.update_layout(
-                    title="Analyse Ombrothermique (Période d'Analyse)",
-                    xaxis=dict(title="Date"),
-                    yaxis=dict(title="Précipitations (mm)", titlefont=dict(color="blue"), tickfont=dict(color="blue")),
-                    yaxis2=dict(title="Température (°C)", titlefont=dict(color="red"), tickfont=dict(color="red"), overlaying='y', side='right'),
+                    title="Graphique Ombrothermique - Période d'Analyse",
+                    xaxis=dict(title="Chronologie"),
+                    yaxis=dict(title="Précipitations (mm)", titlefont=dict(color="#3498db"), tickfont=dict(color="#3498db")),
+                    yaxis2=dict(title="Température (°C)", titlefont=dict(color="#e67e22"), tickfont=dict(color="#e67e22"), overlaying='y', side='right'),
                     legend=dict(x=0.01, y=0.99),
-                    hovermode="x unified"
+                    hovermode="x unified",
+                    template="plotly_white"
                 )
                 st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Données climatiques non disponibles pour cette zone.")
 
         with tab3:
-            st.subheader("Exporter les données d'analyse")
-            report_data = {
-                "Indicateur": ["Surface Inondée (ha)", "Population Totale", "Bâtiments Impactés", "Routes Impactées"],
-                "Valeur": [res['area'], res['t_pop'], bh, rh]
-            }
-            df_report = pd.DataFrame(report_data)
-            st.table(df_report)
+            st.subheader("Exporter les résultats")
             
-            csv = df_report.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Télécharger le Rapport (CSV)", csv, "rapport_floodwatch.csv", "text/csv")
+            # Rapport CSV
+            report_df = pd.DataFrame({
+                "Indicateur": ["Surface Inondée (ha)", "Population Totale", "Population Exposée", "Bâtiments Impactés", "Routes Impactées"],
+                "Valeur": [res['area'], res['t_pop'], res['e_pop'], bh, rh]
+            })
+            st.table(report_df)
             
-            if res['b_hit']:
-                st.download_button("📥 Télécharger Bâtiments Impactés (GeoJSON)", res['b_hit'], "batiments_impactes.geojson", "application/json")
+            ec1, ec2, ec3 = st.columns(3)
+            with ec1:
+                csv = report_df.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Rapport (CSV)", csv, "rapport_impact.csv", "text/csv", use_container_width=True)
+            
+            with ec2:
+                if res['b_hit']:
+                    st.download_button("📥 Bâtiments (GeoJSON)", res['b_hit'], "batiments_impactes.geojson", "application/json", use_container_width=True)
+            
+            with ec3:
+                if res['r_hit']:
+                    st.download_button("📥 Routes (GeoJSON)", res['r_hit'], "routes_impactees.geojson", "application/json", use_container_width=True)
 else:
-    st.info("Veuillez sélectionner une zone dans la barre latérale pour commencer l'analyse.")
+    st.info("💡 Sélectionnez une zone dans la barre latérale et cliquez sur Analyser pour générer le rapport d'impact.")
